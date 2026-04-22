@@ -1,132 +1,190 @@
-# 📊 TG Post Automation
+# 📊 Telegram Content Pipeline
 
-Скрипт для:
-- выгрузки постов из Telegram-каналов  
+Автоматизированная система для:
+
+- сбора постов из Telegram-каналов  
 - генерации аналитических постов через AI  
-- автоматической публикации в канал  
-- уведомлений об ошибках  
+- подбора релевантных изображений  
+- публикации в Telegram-канал  
+- публикации stories  
+- мониторинга, логирования и очистки данных  
 
 ---
 
-## ⚙️ Установка
+## 🚀 Возможности
 
-```bash
-git clone <repo>
-cd tg_post
-
-python3 -m venv venv
-source venv/bin/activate
-
-pip install -r requirements.txt
-cp config.example.json config.json
-```
-
----
-
-## 🧩 Настройка `config.json`
-
-Обязательно заполнить:
-
-```json
-telegram.api_id
-telegram.api_hash
-channels
-openrouter.api_key
-sender.bot_token
-sender.chat_id
-```
+- 🤖 Генерация постов через OpenRouter (Gemini Flash)
+- 📰 Анализ нескольких Telegram-каналов
+- 🖼 Автоматический подбор изображений (Pixabay)
+- 📤 Публикация постов с кнопкой CTA
+- 📲 Публикация stories (через user account)
+- 🔁 Retry при ошибках
+- 🚨 Telegram alerts при сбоях
+- 🗂 Архивация и очистка данных
+- 🔒 Защита от двойных запусков (lock-файлы)
+- 🧪 test / prod окружения
 
 ---
 
-## 🚀 Генерация постов
+## 🧠 Архитектура
 
-```bash
-python get_posts.py
-```
-
-### Режимы
-
-```bash
-# вчера
-python get_posts.py --mode yesterday
-
-# конкретная дата
-python get_posts.py --mode date --date 2026-04-17
-
-# диапазон
-python get_posts.py --mode range --start-date 2026-04-10 --end-date 2026-04-17
-
-# последние N дней
-python get_posts.py --mode days --days 7
-```
+Telegram → get_posts.py → AI → Pixabay → .md посты  
+                                      ↓  
+                               send_posts.py  
+                                      ↓  
+                              Telegram канал  
+                                      ↓  
+                              send_story.py  
+                                      ↓  
+                              Telegram Stories  
 
 ---
 
-## 📤 Отправка постов
+## 📁 Структура проекта
 
-```bash
-python send_posts.py
-```
+exports/                 # сырые JSON выгрузки  
+archive_exports/         # архив выгрузок  
+generated_posts/         # сгенерированные посты (.md)  
+generated_media/         # изображения  
 
-- отправляет **1 пост за запуск**
-- используется в cron
+sent_posts/              # отправленные посты  
+sent_media/  
+
+failed_posts/            # ошибки  
+failed_media/  
+
+raw_ai_responses/     # сырые ответы AI  
+
+logs/  
+locks/  
+state.json  
+
+---
+
+## ⚙️ Основные скрипты
+
+### get_posts.py
+- сбор сообщений  
+- генерация постов  
+- подбор изображений  
+
+### send_posts.py
+- отправка постов  
+- CTA-кнопка  
+- обработка ошибок  
+- триггер story  
+
+### send_story.py
+- публикация story  
+- только первый пост дня  
+
+### cleanup.py
+- очистка старых данных  
+
+### send_test_alert.py
+- тест уведомлений  
+
+### healthcheck.py
+- проверка системы  
+
+---
+
+## 🧩 Конфигурация
+
+config.json
+
+"env": "test"
+
+environments:
+- test
+- prod
+
+---
+
+## 🤖 AI
+
+OpenRouter → google/gemini-2.5-flash  
+
+---
+
+## 🖼 Изображения
+
+Pixabay API  
+
+---
+
+## 📤 Публикация
+
+- Bot API → посты  
+- Telethon → stories  
+
+---
+
+## 🔘 CTA
+
+Настраивается в config  
+
+---
+
+## 🚨 Alerts
+
+Отправка ошибок в Telegram  
+
+---
+
+## 🔁 Retry
+
+Автоматические повторы  
+
+---
+
+## 🔒 Lock
+
+Защита от двойного запуска  
+
+---
+
+## 🧹 Cleanup
+
+Очистка архивов  
+
+---
+
+## 🛠 Установка
+
+python3 -m venv venv  
+source venv/bin/activate  
+pip install -r requirements.txt  
+cp config.example.json config.json  
+chmod +x *.sh  
+python healthcheck.py  
+
+---
+
+## ▶️ Запуск
+
+python get_posts.py  
+python send_posts.py  
+python cleanup.py  
 
 ---
 
 ## ⏱ Cron
 
-```bash
-crontab -e
-```
-
-```cron
-30 8 * * * /root/tg_post/run_generation.sh
-0 9,12,15,18,21 * * * /root/tg_post/run_sending.sh
-```
+30 8 * * * run_generation.sh  
+0 9,12,15,18,21 * * * run_sending.sh  
+15 3 * * 0 run_cleanup.sh  
 
 ---
 
-## 📁 Структура
+## ⚠️ Важно
 
-```
-exports/              
-archive_exports/      
-generated_posts/      
-sent_posts/           
-failed_posts/         
-logs/                 
-locks/                
-```
+- stories только через user account  
+- bot не умеет stories  
+- тестируй в env=test  
 
 ---
 
-## 🔘 Кнопка CTA
+## 📌 Итог
 
-```json
-"sender_cta": {
-  "enabled": true,
-  "text": "Записаться",
-  "url": "https://t.me/username"
-}
-```
-
----
-
-## 🚨 Уведомления
-
-```json
-"alerts": {
-  "enabled": true,
-  "bot_token": "...",
-  "chat_ids": ["@user1", "@user2"]
-}
-```
-
----
-
-## 📊 Логи
-
-```bash
-tail -n 100 logs/export.log
-tail -n 100 logs/sender.log
-```
+Полностью автоматизированная система генерации и публикации контента.

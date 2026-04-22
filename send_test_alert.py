@@ -138,40 +138,26 @@ def send_alert(config: dict, title: str, body: str, logger) -> None:
         except Exception as e:
             logger.error("Ошибка отправки alert (%s): %s", chat_id, e)
 
+import argparse
+import socket
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Тестовая отправка alert-сообщения в Telegram")
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--message", default="Тестовый alert: система уведомлений работает корректно.")
+    return parser.parse_args()
 
 def main():
-    config = load_json("config.json")
-    required = [
-        ("telegram.api_id", config.get("telegram", {}).get("api_id")),
-        ("telegram.api_hash", config.get("telegram", {}).get("api_hash")),
-        ("bots.sender_bot_token", config.get("bots", {}).get("sender_bot_token")),
-        ("bots.alert_bot_token", config.get("bots", {}).get("alert_bot_token")),
-        ("openrouter.api_key", config.get("openrouter", {}).get("api_key")),
-    ]
-    failed = False
-    for name, val in required:
-        if not val:
-            print(f"FAIL: не заполнено {name}")
-            failed = True
-    paths = get_paths(config)
-    for p in [
-        paths.get("output_dir", "exports"),
-        paths.get("archive_exports_dir", "archive_exports"),
-        paths.get("md_output_dir", "generated_posts"),
-        paths.get("sent_posts_dir", "sent_posts"),
-        paths.get("failed_posts_dir", "failed_posts"),
-        paths.get("media_dir", "generated_media"),
-        paths.get("sent_media_dir", "sent_media"),
-        paths.get("failed_media_dir", "failed_media"),
-        paths.get("raw_ai_dir", "raw_ai_responses"),
-        paths.get("log_dir", "logs"),
-        "locks",
-    ]:
-        ensure_dir(p)
-    if failed:
-        raise SystemExit(1)
-    print("OK: базовая проверка пройдена")
-
+    args = parse_args()
+    config = load_json(args.config)
+    logger = setup_logging("send_test_alert", get_paths(config).get("log_dir", "logs"), config.get("runtime", {}).get("log_level", "INFO"), "alert_test.log")
+    send_alert(
+        config,
+        "Тест системы alert",
+        f"Время: {datetime.now().replace(microsecond=0).isoformat()}\nСервер: {socket.gethostname()}\nСообщение: {args.message}",
+        logger,
+    )
+    print("Тестовое сообщение отправлено")
 
 if __name__ == "__main__":
     main()

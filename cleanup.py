@@ -138,40 +138,81 @@ def send_alert(config: dict, title: str, body: str, logger) -> None:
         except Exception as e:
             logger.error("Ошибка отправки alert (%s): %s", chat_id, e)
 
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Очистка архивов и старых файлов")
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+def iter_files_and_dirs(root: Path):
+    if not root.exists():
+        return []
+    return sorted(root.rglob("*"), reverse=True)
+
+def is_older_than(path: Path, days: int) -> bool:
+    cutoff = datetime.now() - timedelta(days=days)
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    return mtime < cutoff
+
+def cleanup_path(root_dir: str, days: int, logger, dry_run: bool):
+    removed_count = 0
+    removed_bytes = 0
+    root = Path(root_dir)
+    if not root.exists():
+        return removed_count, removed_bytes
+    for path in iter_files_and_dirs(root):
+        try:
+            if path.is_file() and is_older_than(path, days):
+                size = path.stat().st_size
+                if dry_run:
+                    logger.info("dry-run remove file: %s", path)
+                else:
+                    path.unlink(missing_ok=True)
+                removed_count += 1
+                removed_bytes += size
+            elif path.is_dir():
+                try:
+                    if not any(path.iterdir()):
+                        if dry_run:
+                            logger.info("dry-run remove empty dir: %s", path)
+                        else:
+                            path.rmdir()
+                except OSError:
+                    pass
+        except FileNotFoundError:
+            continue
+    return removed_count, removed_bytes
 
 def main():
-    config = load_json("config.json")
-    required = [
-        ("telegram.api_id", config.get("telegram", {}).get("api_id")),
-        ("telegram.api_hash", config.get("telegram", {}).get("api_hash")),
-        ("bots.sender_bot_token", config.get("bots", {}).get("sender_bot_token")),
-        ("bots.alert_bot_token", config.get("bots", {}).get("alert_bot_token")),
-        ("openrouter.api_key", config.get("openrouter", {}).get("api_key")),
-    ]
-    failed = False
-    for name, val in required:
-        if not val:
-            print(f"FAIL: не заполнено {name}")
-            failed = True
+    args = parse_args()
+    config = load_json(args.config)
     paths = get_paths(config)
-    for p in [
-        paths.get("output_dir", "exports"),
-        paths.get("archive_exports_dir", "archive_exports"),
-        paths.get("md_output_dir", "generated_posts"),
-        paths.get("sent_posts_dir", "sent_posts"),
-        paths.get("failed_posts_dir", "failed_posts"),
-        paths.get("media_dir", "generated_media"),
-        paths.get("sent_media_dir", "sent_media"),
-        paths.get("failed_media_dir", "failed_media"),
-        paths.get("raw_ai_dir", "raw_ai_responses"),
-        paths.get("log_dir", "logs"),
-        "locks",
-    ]:
-        ensure_dir(p)
-    if failed:
-        raise SystemExit(1)
-    print("OK: базовая проверка пройдена")
-
+    logger = setup_logging("cleanup", paths.get("log_dir", "logs"), config.get("runtime", {}).get("log_level", "INFO"), "cleanup.log")
+    retention = config.get("retention", {})
+    if not retention.get("enabled", False):
+        logger.info("Cleanup отключён")
+        return
+    lock_path = config.get("locks", {}).get("cleanup", "locks/cleanup.lock")
+    with LockFile(lock_path):
+        mapping = [
+            (paths.get("archive_exports_dir", "archive_exports"), retention.get("archive_exports_days", 30)),
+            (paths.get("sent_posts_dir", "sent_posts"), retention.get("sent_posts_days", 30)),
+            (paths.get("sent_media_dir", "sent_media"), retention.get("sent_media_days", 30)),
+            (paths.get("failed_posts_dir", "failed_posts"), retention.get("failed_posts_days", 60)),
+            (paths.get("failed_media_dir", "failed_media"), retention.get("failed_media_days", 60)),
+            (paths.get("raw_ai_dir", "raw_ai_responses"), retention.get("raw_ai_days", 14)),
+            (paths.get("log_dir", "logs"), retention.get("logs_days", 30)),
+        ]
+        total_files = 0
+        total_bytes = 0
+        for root_dir, days in mapping:
+            removed_count, removed_bytes = cleanup_path(root_dir, days, logger, args.dry_run)
+            total_files += removed_count
+            total_bytes += removed_bytes
+            logger.info("path=%s | days=%s | removed=%s | bytes=%s", root_dir, days, removed_count, removed_bytes)
+        logger.info("Cleanup завершён | файлов: %s | байт: %s | dry-run=%s", total_files, total_bytes, args.dry_run)
 
 if __name__ == "__main__":
     main()
