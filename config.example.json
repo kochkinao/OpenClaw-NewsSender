@@ -1,0 +1,73 @@
+{
+  "telegram": {
+    "api_id": 12345678,
+    "api_hash": "YOUR_TELEGRAM_API_HASH",
+    "session_name": "tgpost_session"
+  },
+
+  "timezone": "Europe/Moscow",
+
+  "log_dir": "logs",
+  "log_level": "INFO",
+
+  "state_path": "state.json",
+
+  "output_dir": "exports",
+  "archive_exports_dir": "archive_exports",
+  "output_prefix": "tg_posts",
+
+  "md_output_dir": "generated_posts",
+  "sent_posts_dir": "sent_posts",
+  "failed_posts_dir": "failed_posts",
+
+  "raw_ai_dir": "failed_ai_responses",
+
+  "channels": [
+    "@channel_one",
+    "@channel_two"
+  ],
+
+  "openrouter": {
+    "api_key": "YOUR_OPENROUTER_API_KEY",
+    "model": "google/gemini-2.5-flash",
+    "prompt_file": "prompt.txt",
+    "base_url": "https://openrouter.ai/api/v1/chat/completions",
+    "app_name": "tgpost",
+    "site_url": "",
+    "temperature": 0.4,
+    "max_tokens": 4000
+  },
+
+  "sender": {
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "@your_channel_username"
+  },
+
+  "sender_cta": {
+    "enabled": true,
+    "text": "Записаться",
+    "url": "https://t.me/your_username"
+  },
+
+  "alerts": {
+    "enabled": true,
+    "bot_token": "YOUR_ALERT_BOT_TOKEN",
+
+    "chat_ids": [
+      "@your_username",
+      "@manager_username"
+    ]
+  },
+
+  "validation": {
+    "min_posts": 1,
+    "max_posts": 5,
+    "min_chars": 300,
+    "max_chars": 4000
+  },
+
+  "locks": {
+    "get_posts": "locks/get_posts.lock",
+    "send_posts": "locks/send_posts.lock"
+  }
+}

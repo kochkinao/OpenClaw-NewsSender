@@ -1,0 +1,11 @@
+# Ignore log files
+*.log
+
+# Ignore venv
+venv/
+
+# Ignore secrets
+config.json
+
+# Ignore sessions
+.session
