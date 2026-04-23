@@ -1,3 +1,4 @@
 telethon
 requests
 tzdata
+pillow

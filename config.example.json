@@ -23,6 +23,14 @@
     "enabled": true,
     "provider": "pixabay",
     "api_key": "YOUR_PIXABAY_API_KEY",
+    "short_posts_only": true,
+    "min_post_chars": 0,
+    "max_post_chars": 1000,
+    "daily_photo_post": {
+      "enabled": true,
+      "index": 3,
+      "max_post_chars": 1000
+    },
     "lang": "ru",
     "image_type": "photo",
     "orientation": "horizontal",
@@ -48,10 +56,20 @@
     },
     "stories": {
       "enabled": true,
-      "caption": "Свежие новости уже в канале",
+      "caption": "",
       "append_title_from_post": false,
       "use_first_post_only": true,
-      "period": 86400
+      "period": 86400,
+      "background_image_path": "story_background.jpg",
+      "background_image_url": "",
+      "post_area": {
+        "x": 50,
+        "y": 43,
+        "w": 86,
+        "h": 48,
+        "rotation": 0,
+        "radius": 16
+      }
     }
   },
   "environments": {
@@ -90,9 +108,11 @@
     "log_level": "INFO"
   },
   "validation": {
-    "min_posts": 1,
+    "min_posts": 3,
     "max_posts": 5,
+    "target_min_posts": 3,
     "min_chars": 300,
+    "photo_caption_limit": 1000,
     "max_chars": 3500
   },
   "retention": {

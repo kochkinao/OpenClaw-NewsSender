@@ -1,5 +1,7 @@
 # Ignore log files
 *.log
+logs/
+__pycache__/
 
 # Ignore venv
 venv/
@@ -8,4 +10,17 @@ venv/
 config.json
 
 # Ignore sessions
-.session
+*.session*
+
+# Ignore runtime data
+exports/
+archive_exports/
+generated_posts/
+generated_media/
+sent_posts/
+sent_media/
+failed_posts/
+failed_media/
+raw_ai_responses/
+locks/
+state.json.bak_*

@@ -35,6 +35,8 @@ def sanitize_filename(value: str) -> str:
 
 def setup_logging(name: str, log_dir: str = "logs", log_level: str = "INFO", filename: str | None = None):
     ensure_dir(log_dir)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     logger = logging.getLogger(name)
     level = getattr(logging, log_level.upper(), logging.INFO)
     logger.setLevel(level)
@@ -139,11 +141,17 @@ def send_alert(config: dict, title: str, body: str, logger) -> None:
             logger.error("Ошибка отправки alert (%s): %s", chat_id, e)
 
 import argparse
+import asyncio
 import socket
-from subprocess import run
+import struct
+import zlib
+
+from telethon import TelegramClient, functions, types, utils
+from telethon.errors import RPCError
 
 TELEGRAM_HARD_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
+DEFAULT_PHOTO_POST_LIMIT = 1000
 
 
 def load_state(path: str):
@@ -236,6 +244,23 @@ def send_photo(bot_token: str, chat_id: str, photo, caption: str, parse_mode=Non
         return requests.post(url, data=data, files=files, timeout=60)
 
 
+def extract_message_id(response) -> int | None:
+    if response is None or not response.ok:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    result = payload.get("result") or {}
+    return result.get("message_id")
+
+
+def get_photo_post_limit(config: dict) -> int:
+    validation = config.get("validation", {})
+    image_search = config.get("image_search", {})
+    return int(validation.get("photo_caption_limit", image_search.get("max_post_chars", DEFAULT_PHOTO_POST_LIMIT)))
+
+
 def is_permanent_telegram_error(status_code: int, response_text: str) -> bool:
     lowered = response_text.lower()
     markers = ["chat not found", "bot is not a member", "bot is not an administrator", "forbidden", "unauthorized", "invalid token"]
@@ -286,15 +311,24 @@ def move_associated_files(src_md: Path, target_posts_dir: str, media_target_dir:
     return moved
 
 
+def save_publication_metadata(meta_path: str | None, publication: dict) -> None:
+    if not meta_path:
+        return
+    payload = load_json(meta_path) if Path(meta_path).exists() else {}
+    payload.setdefault("publication", {}).update(publication)
+    save_json(meta_path, payload)
+
+
 def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config: dict, env_cfg: dict, disable_web_page_preview=False):
     text = file_path.read_text(encoding="utf-8").strip()
     if not text:
-        return False, "empty_file"
+        return False, "empty_file", {}
 
     reply_markup = build_reply_markup(config, env_cfg)
     metadata = load_post_metadata(file_path)
-    local_image_path = metadata.get("local_image_path")
-    image_url = metadata.get("image_url")
+    image_enabled = bool(metadata.get("image_enabled", False))
+    local_image_path = metadata.get("local_image_path") if image_enabled else None
+    image_url = metadata.get("image_url") if image_enabled else None
 
     image_source = None
     if local_image_path and Path(local_image_path).exists():
@@ -302,10 +336,19 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
     elif image_url:
         image_source = image_url
 
+    photo_post_limit = get_photo_post_limit(config)
+    if image_source and len(text) > photo_post_limit:
+        logger.info(
+            "Картинка проигнорирована: текст длиннее лимита photo-поста (%s > %s), пост уйдет текстом",
+            len(text),
+            photo_post_limit,
+        )
+        image_source = None
+
     logger.info("Пытаюсь отправить пост: %s | image: %s | кнопка: %s", file_path.name, "yes" if image_source else "no", "enabled" if reply_markup else "disabled")
 
     if image_source:
-        caption, remainder_parts = split_caption_and_remainder(text)
+        caption = text[:TELEGRAM_CAPTION_LIMIT].strip()
 
         def photo_request():
             return send_photo(bot_token, chat_id, image_source, caption, "Markdown", reply_markup)
@@ -317,35 +360,17 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
             photo_response = None
 
         if photo_response is not None and photo_response.ok:
-            for part in remainder_parts:
-                def msg_req():
-                    return send_message(bot_token, chat_id, part, "Markdown", disable_web_page_preview, reply_markup)
-                try:
-                    response = retry_request(msg_req, logger)
-                    if response.ok:
-                        continue
-                except Exception as e:
-                    logger.warning("Дополнительная часть после photo не ушла в Markdown: %s", e)
-
-                def plain_req():
-                    return send_message(bot_token, chat_id, part, None, disable_web_page_preview, reply_markup)
-                try:
-                    fallback = retry_request(plain_req, logger)
-                except Exception as e:
-                    return False, f"temporary_error: {e}"
-                if not fallback.ok:
-                    if is_permanent_telegram_error(fallback.status_code, fallback.text):
-                        return False, f"permanent_error: {fallback.text[:300]}"
-                    return False, f"temporary_error: HTTP {fallback.status_code}: {fallback.text[:300]}"
-            return True, None
+            message_id = extract_message_id(photo_response)
+            return True, None, {"message_ids": [message_id] if message_id else [], "mode": "photo"}
 
         status = photo_response.status_code if photo_response is not None else 0
         body = photo_response.text if photo_response is not None else "no response"
         logger.warning("sendPhoto не сработал, fallback на text. status=%s body=%s", status, body)
         if is_permanent_telegram_error(status, body):
-            return False, f"permanent_error: {body[:300]}"
+            return False, f"permanent_error: {body[:300]}", {}
 
     parts = split_text_for_telegram(text)
+    message_ids = []
     for part in parts:
         def markdown_request():
             return send_message(bot_token, chat_id, part, "Markdown", disable_web_page_preview, reply_markup)
@@ -355,25 +380,27 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
             logger.warning("Markdown-отправка не удалась: %s", e)
             response = None
         if response is not None and response.ok:
+            message_ids.append(extract_message_id(response))
             continue
 
         status = response.status_code if response is not None else 0
         body = response.text if response is not None else "no response"
         if is_permanent_telegram_error(status, body):
-            return False, f"permanent_error: {body[:300]}"
+            return False, f"permanent_error: {body[:300]}", {}
 
         def plain_request():
             return send_message(bot_token, chat_id, part, None, disable_web_page_preview, reply_markup)
         try:
             fallback = retry_request(plain_request, logger)
         except Exception as e:
-            return False, f"temporary_error: {e}"
+            return False, f"temporary_error: {e}", {}
         if not fallback.ok:
             if is_permanent_telegram_error(fallback.status_code, fallback.text):
-                return False, f"permanent_error: {fallback.text[:300]}"
-            return False, f"temporary_error: HTTP {fallback.status_code}: {fallback.text[:300]}"
+                return False, f"permanent_error: {fallback.text[:300]}", {}
+            return False, f"temporary_error: HTTP {fallback.status_code}: {fallback.text[:300]}", {}
+        message_ids.append(extract_message_id(fallback))
 
-    return True, None
+    return True, None, {"message_ids": [mid for mid in message_ids if mid], "mode": "text"}
 
 
 def should_send_story(config: dict, env_name: str, post_filename: str, state: dict) -> bool:
@@ -390,15 +417,198 @@ def should_send_story(config: dict, env_name: str, post_filename: str, state: di
     return not story_state.get(f"sent_{env_name}", False)
 
 
-def trigger_story(config_path: str, post_file: str, env_name: str, logger):
-    story_script = str(Path(config_path).with_name("send_story.py"))
-    cmd = [sys.executable, story_script, "--config", config_path, "--post-file", post_file, "--env", env_name]
-    logger.info("Запускаю story trigger: %s", " ".join(cmd))
-    result = run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        logger.info("Story trigger выполнен успешно: %s", result.stdout.strip())
-    else:
-        logger.error("Story trigger завершился с ошибкой: %s | %s", result.stdout, result.stderr)
+def strip_markdown_for_story(text: str) -> str:
+    text = re.sub(r"[*_`#>\[\]()]+", "", text)
+    text = re.sub(r"━━━━━━━━━━━━━━━.*", "", text, flags=re.S)
+    text = re.sub(r"⚠️\s*Дисклеймер:.*", "", text, flags=re.S)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_story_title_and_body(post_text: str) -> tuple[str, str]:
+    clean = strip_markdown_for_story(post_text)
+    lines = [line.strip(" -—\t") for line in clean.splitlines() if line.strip()]
+    title = lines[0].replace("📌", "").strip() if lines else "Новый пост в канале"
+    body_lines = [line for line in lines[1:] if not line.startswith(("📰", "📊", "📉", "💡"))]
+    body = " ".join(body_lines[:8]).strip()
+    return title[:120], body[:520]
+
+
+def get_story_font(size: int, bold: bool = False):
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None
+
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return ImageFont.truetype(candidate, size)
+    return ImageFont.load_default()
+
+
+def draw_wrapped_text(draw, xy, text: str, font, fill, max_width: int, line_spacing: int = 10, max_lines: int | None = None) -> int:
+    x, y = xy
+    lines = []
+    for paragraph in text.splitlines() or [text]:
+        current = ""
+        for word in paragraph.split():
+            trial = f"{current} {word}".strip()
+            bbox = draw.textbbox((0, 0), trial, font=font)
+            if bbox[2] - bbox[0] <= max_width or not current:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+    if max_lines:
+        lines = lines[:max_lines]
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        bbox = draw.textbbox((x, y), line, font=font)
+        y += (bbox[3] - bbox[1]) + line_spacing
+    return y
+
+
+def generate_story_card_image(post_text: str, config: dict, width: int = 1080, height: int = 1920) -> tuple[bytes, str]:
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return generate_default_story_background(width, height), "story_background.png"
+
+    title, body = extract_story_title_and_body(post_text)
+    image = Image.new("RGB", (width, height), (9, 16, 26))
+    draw = ImageDraw.Draw(image)
+
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
+        color = (
+            int(20 * (1 - ratio) + 6 * ratio),
+            int(42 * (1 - ratio) + 12 * ratio),
+            int(58 * (1 - ratio) + 22 * ratio),
+        )
+        draw.line([(0, y), (width, y)], fill=color)
+
+    card = (86, 360, 994, 1280)
+    draw.rounded_rectangle(card, radius=52, fill=(245, 240, 226), outline=(224, 177, 84), width=5)
+    draw.rounded_rectangle((126, 410, 430, 472), radius=31, fill=(19, 32, 45))
+
+    label_font = get_story_font(28, bold=True)
+    title_font = get_story_font(54, bold=True)
+    body_font = get_story_font(35)
+    cta_font = get_story_font(34, bold=True)
+
+    draw.text((158, 424), "НОВЫЙ ПОСТ", font=label_font, fill=(245, 240, 226))
+    y = draw_wrapped_text(draw, (136, 545), title, title_font, (18, 32, 45), 810, line_spacing=16, max_lines=5)
+    y += 34
+    draw_wrapped_text(draw, (136, y), body, body_font, (42, 54, 66), 810, line_spacing=13, max_lines=8)
+    draw.rounded_rectangle((136, 1160, 944, 1232), radius=36, fill=(18, 32, 45))
+    draw.text((272, 1177), "Нажмите, чтобы открыть пост", font=cta_font, fill=(245, 240, 226))
+
+    import io
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue(), "story_card.png"
+
+
+def generate_default_story_background(width: int = 1080, height: int = 1920) -> bytes:
+    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + chunk_type
+            + data
+            + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+        )
+
+    top = (18, 32, 48)
+    bottom = (7, 12, 20)
+    rows = []
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
+        color = bytes(int(top[i] * (1 - ratio) + bottom[i] * ratio) for i in range(3))
+        rows.append(b"\x00" + color * width)
+
+    raw = b"".join(rows)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(raw, 9))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def build_post_area(config: dict, input_channel, message_id: int):
+    area_cfg = config.get("content", {}).get("stories", {}).get("post_area", {})
+    coordinates = types.MediaAreaCoordinates(
+        x=float(area_cfg.get("x", 50)),
+        y=float(area_cfg.get("y", 43)),
+        w=float(area_cfg.get("w", 86)),
+        h=float(area_cfg.get("h", 48)),
+        rotation=float(area_cfg.get("rotation", 0)),
+        radius=float(area_cfg.get("radius", 16)),
+    )
+    return types.InputMediaAreaChannelPost(
+        coordinates=coordinates,
+        channel=input_channel,
+        msg_id=message_id,
+    )
+
+
+async def publish_story_for_post(config: dict, env_name: str, env_cfg: dict, post_file: str, message_id: int, state: dict, logger) -> bool:
+    stories = config.get("content", {}).get("stories", {})
+    if not stories.get("enabled", False):
+        return False
+
+    post_path = Path(post_file)
+    post_text = post_path.read_text(encoding="utf-8").strip()
+    story_chat_id = env_cfg.get("story_chat_id")
+    channel_chat_id = env_cfg.get("channel_chat_id")
+    if not story_chat_id or not channel_chat_id:
+        raise ValueError(f"Не заполнены environments.{env_name}.story_chat_id/channel_chat_id")
+
+    image_bytes, file_name = generate_story_card_image(post_text, config)
+    tg = config.get("telegram", {})
+    async with TelegramClient(tg["session_name"], tg["api_id"], tg["api_hash"]) as client:
+        peer = await client.get_input_entity(story_chat_id)
+        await client(functions.stories.CanSendStoryRequest(peer=peer))
+        uploaded = await client.upload_file(image_bytes, file_name=file_name)
+        media = types.InputMediaUploadedPhoto(file=uploaded)
+        channel_entity = await client.get_entity(channel_chat_id)
+        input_channel = utils.get_input_channel(channel_entity)
+        media_area = build_post_area(config, input_channel, int(message_id))
+        await client(functions.stories.SendStoryRequest(
+            peer=peer,
+            media=media,
+            media_areas=[media_area],
+            caption=stories.get("caption", "").strip()[:2048],
+            privacy_rules=[types.InputPrivacyValueAllowAll()],
+            period=stories.get("period", 86400),
+        ))
+
+    day_label = post_path.name[:10]
+    story_state = state.setdefault("days", {}).setdefault(day_label, {}).setdefault("story", {})
+    story_state[f"sent_{env_name}"] = True
+    story_state[f"sent_at_{env_name}"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    story_state[f"post_file_{env_name}"] = str(post_file)
+    story_state[f"message_id_{env_name}"] = int(message_id)
+    logger.info("Story опубликована из send_posts.py | env=%s | post=%s | message_id=%s", env_name, post_file, message_id)
+    return True
+
+
+def mark_story_failure(state: dict, env_name: str, post_file: str, message_id: int, error: Exception) -> None:
+    post_path = Path(post_file)
+    day_label = post_path.name[:10]
+    story_state = state.setdefault("days", {}).setdefault(day_label, {}).setdefault("story", {})
+    story_state[f"status_{env_name}"] = "failed"
+    story_state[f"failed_at_{env_name}"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    story_state[f"post_file_{env_name}"] = str(post_file)
+    story_state[f"message_id_{env_name}"] = int(message_id)
+    story_state[f"error_{env_name}"] = str(error)
 
 
 def parse_args():
@@ -451,17 +661,49 @@ def main():
                 logger.info("dry-run: пост был бы отправлен: %s", next_post)
                 return 0
 
-            ok, error_kind = try_send_post(bot_token, chat_id, next_post, logger, config, env_cfg, args.disable_web_page_preview)
+            ok, error_kind, send_result = try_send_post(bot_token, chat_id, next_post, logger, config, env_cfg, args.disable_web_page_preview)
             state = load_state(state_path)
             queue = state.setdefault("send_queue", [])
 
             if ok:
                 moved = move_associated_files(next_post, sent_posts_dir, sent_media_dir, logger)
-                queue.append({"file": moved["md"], "status": "sent", "env": env_name, "sent_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                message_ids = send_result.get("message_ids") or []
+                publication = {
+                    "env": env_name,
+                    "chat_id": chat_id,
+                    "message_id": message_ids[0] if message_ids else None,
+                    "message_ids": message_ids,
+                    "mode": send_result.get("mode"),
+                    "sent_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                save_publication_metadata(moved.get("meta"), publication)
+                queue.append({"file": moved["md"], "status": "sent", **publication})
                 save_state(state_path, state)
 
-                if should_send_story(config, env_name, Path(moved["md"]).name, state):
-                    trigger_story(args.config, moved["md"], env_name, logger)
+                if publication["message_id"] and should_send_story(config, env_name, Path(moved["md"]).name, state):
+                    try:
+                        asyncio.run(publish_story_for_post(
+                            config,
+                            env_name,
+                            env_cfg,
+                            moved["md"],
+                            publication["message_id"],
+                            state,
+                            logger,
+                        ))
+                        save_state(state_path, state)
+                    except RPCError as e:
+                        logger.exception("RPC ошибка публикации story: %s", e)
+                        mark_story_failure(state, env_name, moved["md"], publication["message_id"], e)
+                        save_state(state_path, state)
+                        send_alert(config, "Ошибка публикации story", f"Env: {env_name}\nФайл: {moved['md']}\nОшибка: {e}", logger)
+                    except Exception as e:
+                        logger.exception("Критическая ошибка публикации story: %s", e)
+                        mark_story_failure(state, env_name, moved["md"], publication["message_id"], e)
+                        save_state(state_path, state)
+                        send_alert(config, "Критическая ошибка публикации story", f"Env: {env_name}\nФайл: {moved['md']}\nОшибка: {e}", logger)
+                elif not publication["message_id"]:
+                    logger.warning("Story не запущена: Telegram не вернул message_id для %s", moved["md"])
                 return 0
 
             if error_kind and error_kind.startswith("permanent_error"):

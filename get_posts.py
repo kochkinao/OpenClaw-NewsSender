@@ -35,6 +35,8 @@ def sanitize_filename(value: str) -> str:
 
 def setup_logging(name: str, log_dir: str = "logs", log_level: str = "INFO", filename: str | None = None):
     ensure_dir(log_dir)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     logger = logging.getLogger(name)
     level = getattr(logging, log_level.upper(), logging.INFO)
     logger.setLevel(level)
@@ -358,7 +360,11 @@ def call_openrouter(config: dict, prompt_text: str, source_text: str, logger, sy
         "messages": [
             {
                 "role": "system",
-                "content": system_prompt or 'Ты редактор финансового Telegram-канала. Верни строго JSON вида {"posts":[{"title":"...","content":"..."}]}. Без пояснений.'
+                "content": system_prompt or (
+                    'Ты редактор финансового Telegram-канала. '
+                    'Группируй входящие новости по смыслу и не растягивай слабый день на лишние посты. '
+                    'Верни строго JSON вида {"posts":[{"title":"...","content":"..."}]}. Без пояснений.'
+                )
             },
             {
                 "role": "user",
@@ -421,12 +427,110 @@ def validate_posts(posts, config):
     return valid
 
 
+def rewrite_photo_slot_post(post: dict, config: dict, logger, limit: int) -> dict:
+    target_limit = limit
+    content = post["content"]
+    prompt = (
+        f"Если это можно сделать без потери смысла, перепиши финансовый Telegram-пост в короткий вариант до {target_limit} символов. "
+        "Если для сохранения смысла нужен более длинный текст — верни исходный пост без сокращения. "
+        "Нельзя обрывать фразы, нельзя терять главный смысл, нельзя выдумывать факты. "
+        "Сохрани стиль исходного канала: эмодзи в заголовке и названиях блоков обязательны. "
+        "Сохрани структуру: 📌 заголовок, 📰 новость, 📉 влияние на рынок, 💡 как использовать, ⚠️ дисклеймер. "
+        "Верни только готовый текст поста без JSON и без markdown-блоков."
+    )
+    raw = call_openrouter(config, prompt, content, logger, system_prompt=prompt)
+    rewritten = extract_json_block(raw).strip()
+    if len(rewritten) <= limit:
+        return {"title": post["title"], "content": rewritten}
+    logger.info("Photo-пост оставлен текстовым: разумное сокращение не уложилось в лимит (%s > %s)", len(rewritten), limit)
+    return post
+
+
+def enforce_daily_photo_post(posts: list[dict], config: dict, logger) -> list[dict]:
+    rules = get_image_rules(config)
+    if not rules["daily_photo_enabled"]:
+        return posts
+    index = rules["daily_photo_index"] - 1
+    if index < 0 or index >= len(posts):
+        return posts
+    limit = rules["daily_photo_max_chars"]
+    post = posts[index]
+    content = post["content"].strip()
+    if len(content) <= limit:
+        return posts
+    rewritten = rewrite_photo_slot_post(post, config, logger, limit)
+    if len(rewritten["content"]) <= limit:
+        posts[index] = rewritten
+        logger.info("Пост #%s переписан AI для daily photo slot: %s -> %s символов", rules["daily_photo_index"], len(content), len(rewritten["content"]))
+    else:
+        logger.warning("Пост #%s остался длиннее лимита photo slot: %s > %s", rules["daily_photo_index"], len(rewritten["content"]), limit)
+    return posts
+
+
+def get_image_rules(config: dict) -> dict:
+    validation = config.get("validation", {})
+    image_search = config.get("image_search", {})
+    caption_limit = int(validation.get("photo_caption_limit", image_search.get("photo_caption_limit", 1000)))
+    daily_photo = image_search.get("daily_photo_post", {})
+    return {
+        "short_posts_only": image_search.get("short_posts_only", True),
+        "max_chars": int(image_search.get("max_post_chars", caption_limit)),
+        "min_chars": int(image_search.get("min_post_chars", 0)),
+        "daily_photo_enabled": daily_photo.get("enabled", True),
+        "daily_photo_index": int(daily_photo.get("index", 3)),
+        "daily_photo_max_chars": int(daily_photo.get("max_post_chars", caption_limit)),
+    }
+
+
+def get_image_skip_reason(post_text: str, config: dict, post_index: int | None = None) -> str | None:
+    image_search = config.get("image_search", {})
+    if not image_search.get("enabled", False):
+        return "image_search_disabled"
+
+    rules = get_image_rules(config)
+    length = len(post_text.strip())
+    if (
+        rules["daily_photo_enabled"]
+        and post_index == rules["daily_photo_index"]
+        and length <= rules["daily_photo_max_chars"]
+    ):
+        return None
+    if rules["short_posts_only"] and length > rules["max_chars"]:
+        return f"post_too_long_for_image:{length}>{rules['max_chars']}"
+    if rules["min_chars"] and length < rules["min_chars"]:
+        return f"post_too_short_for_image:{length}<{rules['min_chars']}"
+    return None
+
+
 def save_raw_ai_response(raw_dir: str, day_label: str, content: str) -> str:
     ensure_dir(raw_dir)
     path = Path(raw_dir) / f"{day_label}_raw_ai_response.json"
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return str(path)
+
+
+def generate_valid_posts(config: dict, prompt_text: str, source_text: str, day_label: str, raw_dir: str, logger):
+    last_error = None
+    last_raw_path = None
+    for attempt in range(1, 3):
+        effective_prompt = prompt_text
+        if attempt > 1:
+            effective_prompt = (
+                prompt_text
+                + "\n\nКРИТИЧЕСКИ ВАЖНО: верни только полностью валидный JSON без markdown-блоков. "
+                + "Не обрывай строки. Если данных мало, сделай ровно 3 поста, объединив связанные новости, но не выдумывай факты."
+            )
+        raw = call_openrouter(config, effective_prompt, source_text, logger)
+        suffix = "" if attempt == 1 else f"_attempt_{attempt}"
+        last_raw_path = save_raw_ai_response(raw_dir, f"{day_label}{suffix}", raw)
+        try:
+            posts = parse_ai_posts(raw)
+            return posts, last_raw_path
+        except json.JSONDecodeError as e:
+            last_error = e
+            logger.warning("AI вернул невалидный JSON за %s, попытка %s/2: %s", day_label, attempt, e)
+    raise last_error
 
 
 def save_markdown_posts(posts, out_dir: str, day_label: str, logger):
@@ -442,9 +546,24 @@ def save_markdown_posts(posts, out_dir: str, day_label: str, logger):
 
 
 def build_image_query(post_text: str, config: dict, logger) -> str:
-    prompt = "Сформулируй один короткий поисковый запрос на английском для редакционной иллюстрации к финансовому посту. Только сам запрос."
+    prompt = (
+        "Извлеки визуальный смысл финансового поста и сформулируй один поисковый запрос на английском для Pixabay. "
+        "Запрос должен быть конкретным, 5-9 слов, без кавычек. "
+        "Добавь визуальный объект и рыночный контекст: например 'software company ipo stock exchange trading screen'. "
+        "Не используй общие запросы вроде 'business', 'finance', 'money', 'stock market', 'IT company IPO' без уточнения. "
+        "Если в посте IPO/listing/Мосбиржа — обязательно используй слова stock exchange, ipo, trading screen, software или technology. "
+        "Если тема дивидендов — используй dividend, bank, shareholders, stock chart. "
+        "Если тема облигаций — используй government bonds, yield, finance chart. "
+        "Не ищи буквальные русские названия компаний; ищи тематическую рыночную иллюстрацию. "
+        "Верни только сам запрос."
+    )
     raw = call_openrouter(config, prompt, post_text, logger, system_prompt=prompt)
-    return raw.strip().replace("\n", " ")[:100]
+    query = re.sub(r"[^A-Za-z0-9 ,&-]+", " ", raw.strip().replace("\n", " "))
+    query = re.sub(r"\s+", " ", query).strip(" ,-")[:100]
+    generic_queries = {"business", "finance", "money", "stock market", "financial market", "it company ipo"}
+    if not query or query.lower() in generic_queries:
+        return "financial market analysis news"
+    return query
 
 
 def score_pixabay_hit(hit: dict) -> tuple:
@@ -454,6 +573,27 @@ def score_pixabay_hit(hit: dict) -> tuple:
     width = int(hit.get("imageWidth", 0) or 0)
     height = int(hit.get("imageHeight", 0) or 0)
     return (downloads + likes * 3 + comments * 2, width * height)
+
+
+def is_generic_pixabay_hit(hit: dict, query: str) -> bool:
+    tags = (hit.get("tags") or "").lower()
+    page_url = (hit.get("pageURL") or "").lower()
+    haystack = f"{tags} {page_url}"
+    generic_terms = {
+        "coffee", "кофе", "cup", "чашка", "pen", "ручка", "post-it", "notebook",
+        "блокнот", "office", "офис", "desk", "стол", "meeting", "совещание",
+        "handshake", "рукопожатие", "laptop", "ноутбук"
+    }
+    strong_terms = {
+        "stock", "stocks", "exchange", "trading", "chart", "market", "ipo", "shares",
+        "dividend", "bond", "yield", "bank", "finance", "investment", "software",
+        "technology", "data", "screen", "биржа", "акции", "график", "рынок"
+    }
+    has_generic = any(term in haystack for term in generic_terms)
+    has_strong = any(term in haystack for term in strong_terms)
+    query_words = {w for w in re.findall(r"[a-z]{4,}", query.lower()) if w not in {"company", "financial", "market"}}
+    overlaps_query = any(word in haystack for word in query_words)
+    return has_generic and not (has_strong or overlaps_query)
 
 
 def search_image_metadata(query: str, config: dict, logger) -> dict | None:
@@ -484,7 +624,11 @@ def search_image_metadata(query: str, config: dict, logger) -> dict | None:
     hits = data.get("hits", []) or []
     if not hits:
         return None
-    hits = sorted(hits, key=score_pixabay_hit, reverse=True)
+    filtered_hits = [hit for hit in hits if not is_generic_pixabay_hit(hit, query)]
+    if not filtered_hits:
+        logger.warning("Pixabay не дал релевантных картинок для запроса '%s'", query)
+        return None
+    hits = sorted(filtered_hits, key=score_pixabay_hit, reverse=True)
     best = hits[0]
     image_url = best.get("largeImageURL") or best.get("webformatURL")
     if not image_url:
@@ -606,63 +750,69 @@ async def main():
                                 config["openrouter"].get("prompt_file", "prompt.txt")
                             ).read_text(encoding="utf-8").strip()
 
-                            raw = call_openrouter(
+                            posts_raw, raw_path = generate_valid_posts(
                                 config,
                                 prompt_text,
                                 build_ai_payload(payload),
+                                day_label,
+                                paths.get("raw_ai_dir", "raw_ai_responses"),
                                 logger,
                             )
 
-                            raw_path = save_raw_ai_response(
-                                paths.get("raw_ai_dir", "raw_ai_responses"),
-                                day_label,
-                                raw,
-                            )
-
-                            posts = validate_posts(parse_ai_posts(raw), config)
+                            posts = enforce_daily_photo_post(validate_posts(posts_raw, config), config, logger)
                             saved = save_markdown_posts(posts, md_output_dir, day_label, logger)
 
-                            if not args.skip_images:
-                                for idx, (md_path, post) in enumerate(zip(saved, posts), start=1):
-                                    metadata = {
-                                        "image_enabled": False,
-                                        "image_query": None,
-                                        "image_url": None,
-                                        "local_image_path": None,
-                                    }
+                            for idx, (md_path, post) in enumerate(zip(saved, posts), start=1):
+                                metadata = {
+                                    "image_enabled": False,
+                                    "image_policy": "daily_photo_slot" if idx == get_image_rules(config)["daily_photo_index"] else "short_post_only",
+                                    "image_query": None,
+                                    "image_url": None,
+                                    "local_image_path": None,
+                                    "image_skipped_reason": None,
+                                    "post_chars": len(post["content"].strip()),
+                                }
 
-                                    try:
-                                        image_meta = search_image_metadata(
-                                            build_image_query(post["content"], config, logger),
-                                            config,
-                                            logger,
-                                        )
-
-                                        if image_meta:
-                                            metadata.update({
-                                                "image_enabled": True,
-                                                "image_query": image_meta.get("image_query"),
-                                                "image_url": image_meta.get("image_url"),
-                                                "image_provider": image_meta.get("provider"),
-                                                "image_page_url": image_meta.get("page_url"),
-                                                "image_author": image_meta.get("author"),
-                                                "image_author_id": image_meta.get("author_id"),
-                                                "image_tags": image_meta.get("tags"),
-                                            })
-
-                                            if config.get("image_storage", {}).get("enabled", True) and config.get("image_storage", {}).get("download", True):
-                                                metadata["local_image_path"] = download_image(
-                                                    image_meta["image_url"],
-                                                    str(Path(media_dir) / day_label),
-                                                    day_label,
-                                                    idx,
-                                                    logger,
-                                                )
-
-                                    except Exception as img_err:
-                                        logger.warning("Не удалось подобрать/сохранить картинку для %s: %s", md_path, img_err)
-
+                                skip_reason = "skip_images_cli" if args.skip_images else get_image_skip_reason(post["content"], config, idx)
+                                if skip_reason:
+                                    metadata["image_skipped_reason"] = skip_reason
+                                    logger.info("Картинка не нужна для %s: %s", md_path, skip_reason)
                                     save_post_metadata(md_path, metadata, logger)
+                                    continue
+
+                                try:
+                                    image_query = build_image_query(post["content"], config, logger)
+                                    metadata["image_query"] = image_query
+                                    image_meta = search_image_metadata(image_query, config, logger)
+
+                                    if image_meta:
+                                        metadata.update({
+                                            "image_enabled": True,
+                                            "image_query": image_meta.get("image_query"),
+                                            "image_url": image_meta.get("image_url"),
+                                            "image_provider": image_meta.get("provider"),
+                                            "image_page_url": image_meta.get("page_url"),
+                                            "image_author": image_meta.get("author"),
+                                            "image_author_id": image_meta.get("author_id"),
+                                            "image_tags": image_meta.get("tags"),
+                                        })
+
+                                        if config.get("image_storage", {}).get("enabled", True) and config.get("image_storage", {}).get("download", True):
+                                            metadata["local_image_path"] = download_image(
+                                                image_meta["image_url"],
+                                                str(Path(media_dir) / day_label),
+                                                day_label,
+                                                idx,
+                                                logger,
+                                            )
+                                    else:
+                                        metadata["image_skipped_reason"] = "no_relevant_image_found"
+
+                                except Exception as img_err:
+                                    metadata["image_skipped_reason"] = f"image_error:{img_err}"
+                                    logger.warning("Не удалось подобрать/сохранить картинку для %s: %s", md_path, img_err)
+
+                                save_post_metadata(md_path, metadata, logger)
 
                         day_state["generation"] = {
                             "status": "done" if saved else "empty",

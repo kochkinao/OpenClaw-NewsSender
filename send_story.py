@@ -3,8 +3,10 @@ import json
 import logging
 import os
 import re
+import struct
 import sys
 import time
+import zlib
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -140,6 +142,7 @@ def send_alert(config: dict, title: str, body: str, logger) -> None:
 
 import argparse
 import asyncio
+from telethon import utils
 from telethon import TelegramClient, functions, types
 from telethon.errors import RPCError
 
@@ -149,6 +152,7 @@ def parse_args():
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--env", choices=["test", "prod"], default=None)
     parser.add_argument("--post-file", required=True)
+    parser.add_argument("--message-id", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -182,6 +186,85 @@ def build_story_caption(config: dict, post_text: str) -> str:
     return caption[:2048]
 
 
+def get_publication_metadata(metadata: dict, env_name: str) -> dict:
+    publication = metadata.get("publication") or {}
+    if publication.get("env") in {None, env_name}:
+        return publication
+    return {}
+
+
+def generate_default_story_background(width: int = 1080, height: int = 1920) -> bytes:
+    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + chunk_type
+            + data
+            + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+        )
+
+    top = (18, 32, 48)
+    bottom = (7, 12, 20)
+    rows = []
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
+        color = bytes(
+            int(top[i] * (1 - ratio) + bottom[i] * ratio)
+            for i in range(3)
+        )
+        rows.append(b"\x00" + color * width)
+
+    raw = b"".join(rows)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(raw, 9))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def resolve_story_background(config: dict, metadata: dict) -> tuple[str | bytes | None, str | None]:
+    stories = config.get("content", {}).get("stories", {})
+    background_path = stories.get("background_image_path")
+    if background_path and Path(background_path).exists():
+        return background_path, None
+
+    background_url = stories.get("background_image_url")
+    if background_url:
+        response = requests.get(background_url, timeout=60)
+        response.raise_for_status()
+        return response.content, "story_background.jpg"
+
+    # Fallback keeps old posts usable, but story no longer depends on the post image when a background is configured.
+    local_image_path = metadata.get("local_image_path")
+    if local_image_path and Path(local_image_path).exists():
+        return local_image_path, None
+
+    image_url = metadata.get("image_url")
+    if image_url:
+        response = requests.get(image_url, timeout=60)
+        response.raise_for_status()
+        return response.content, "story_background.jpg"
+
+    return generate_default_story_background(), "story_background.png"
+
+
+def build_post_area(config: dict, input_channel, message_id: int):
+    area_cfg = config.get("content", {}).get("stories", {}).get("post_area", {})
+    coordinates = types.MediaAreaCoordinates(
+        x=float(area_cfg.get("x", 50)),
+        y=float(area_cfg.get("y", 62)),
+        w=float(area_cfg.get("w", 82)),
+        h=float(area_cfg.get("h", 34)),
+        rotation=float(area_cfg.get("rotation", 0)),
+        radius=float(area_cfg.get("radius", 16)),
+    )
+    return types.InputMediaAreaChannelPost(
+        coordinates=coordinates,
+        channel=input_channel,
+        msg_id=message_id,
+    )
+
+
 async def main():
     args = parse_args()
     config = load_json(args.config)
@@ -213,18 +296,22 @@ async def main():
 
             post_text = post_file.read_text(encoding="utf-8").strip()
             metadata = read_metadata(post_file)
-            local_image_path = metadata.get("local_image_path")
-            image_url = metadata.get("image_url")
-            if not local_image_path and not image_url:
-                raise ValueError("Нет изображения для story")
+            publication = get_publication_metadata(metadata, env_name)
+            message_id = args.message_id or publication.get("message_id")
+            if not message_id:
+                raise ValueError("Нет message_id опубликованного поста для story")
 
             caption = build_story_caption(config, post_text)
             story_chat_id = env_cfg.get("story_chat_id")
             if not story_chat_id:
                 raise ValueError(f"Не заполнен environments.{env_name}.story_chat_id")
+            channel_chat_id = publication.get("chat_id") or env_cfg.get("channel_chat_id")
+            if not channel_chat_id:
+                raise ValueError(f"Не заполнен environments.{env_name}.channel_chat_id")
 
+            background, background_file_name = resolve_story_background(config, metadata)
             if args.dry_run:
-                logger.info("dry-run: story была бы опубликована | env=%s | file=%s", env_name, post_file)
+                logger.info("dry-run: story была бы опубликована | env=%s | file=%s | message_id=%s", env_name, post_file, message_id)
                 return
 
             tg = config.get("telegram", {})
@@ -232,18 +319,20 @@ async def main():
                 peer = await client.get_input_entity(story_chat_id)
                 await client(functions.stories.CanSendStoryRequest(peer=peer))
 
-                if local_image_path and Path(local_image_path).exists():
-                    uploaded = await client.upload_file(local_image_path)
+                if isinstance(background, bytes):
+                    uploaded = await client.upload_file(background, file_name=background_file_name or "story_background.jpg")
                 else:
-                    response = requests.get(image_url, timeout=60)
-                    response.raise_for_status()
-                    uploaded = await client.upload_file(response.content)
+                    uploaded = await client.upload_file(background)
 
                 media = types.InputMediaUploadedPhoto(file=uploaded)
+                channel_entity = await client.get_entity(channel_chat_id)
+                input_channel = utils.get_input_channel(channel_entity)
+                media_area = build_post_area(config, input_channel, int(message_id))
 
                 await client(functions.stories.SendStoryRequest(
                     peer=peer,
                     media=media,
+                    media_areas=[media_area],
                     caption=caption,
                     privacy_rules=[types.InputPrivacyValueAllowAll()],
                     period=stories.get("period", 86400),
@@ -252,8 +341,9 @@ async def main():
             story_state[f"sent_{env_name}"] = True
             story_state[f"sent_at_{env_name}"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             story_state[f"post_file_{env_name}"] = str(post_file)
+            story_state[f"message_id_{env_name}"] = int(message_id)
             save_state(state_path, state)
-            logger.info("Story опубликована | env=%s | post=%s", env_name, post_file)
+            logger.info("Story опубликована | env=%s | post=%s | message_id=%s", env_name, post_file, message_id)
 
         except RPCError as e:
             logger.exception("RPC ошибка send_story.py: %s", e)

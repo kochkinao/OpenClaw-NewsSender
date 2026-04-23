@@ -23,6 +23,31 @@
         "sent_at_test": "2026-04-22T21:34:37",
         "post_file_test": "sent_posts\\2026-04-21_01_🇨🇳_Китайский_регулятор_сохранил_базовую_ставку_на_уровне_3%.md"
       }
+    },
+    "2026-04-22": {
+      "export": {
+        "status": "done",
+        "json_path": "exports\\tgposts_2026-04-22_exported_2026-04-23_15-33-53.json",
+        "messages_count": 6
+      },
+      "generation": {
+        "status": "done",
+        "posts_created": 4,
+        "md_paths": [
+          "generated_posts\\2026-04-22_01_💰_Дивиденды_«Сбера»_и_неопределенность_в_ФРС_США__ключевые_события_для_инвесторов.md",
+          "generated_posts\\2026-04-22_02_🔄_«Циан»_завершает_обмен_акций__последний_шанс_для_инвесторов.md",
+          "generated_posts\\2026-04-22_03_📈_Минфин_РФ_разместил_ОФЗ_на_215,5_млрд_рублей__высокая_доходность_привлекает_инвесторов.md",
+          "generated_posts\\2026-04-22_04_🚨_Скандал_вокруг_Hybe_(BTS)_и_выход_«Фабрики_ПО»_на_Мосбиржу.md"
+        ],
+        "raw_ai_path": "raw_ai_responses\\2026-04-22_raw_ai_response.json"
+      },
+      "story": {
+        "status_test": "failed",
+        "failed_at_test": "2026-04-23T16:34:38",
+        "post_file_test": "sent_posts\\2026-04-22_01_💰_Дивиденды_«Сбера»_и_неопределенность_в_ФРС_США__ключевые_события_для_инвесторов.md",
+        "message_id_test": 26,
+        "error_test": "RPCError 400: BOOSTS_REQUIRED (caused by CanSendStoryRequest)"
+      }
     }
   },
   "send_queue": [
@@ -31,7 +56,139 @@
       "status": "sent",
       "env": "test",
       "sent_at": "2026-04-22T21:34:32"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_01_💰_Сбербанк_рекомендует_рекордные_дивиденды.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 19,
+      "message_ids": [
+        19
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T15:54:12"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_02_🏛️_Минфин_РФ_разместил_ОФЗ_на_215,5_млрд_рублей.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 20,
+      "message_ids": [
+        20
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T15:55:02"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_03_🔄_«Циан»_запускает_финальный_раунд_обмена_акций.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 21,
+      "message_ids": [
+        21
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T15:55:07"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_04_🚀_Московская_биржа_допустит_акции_«Фабрики_ПО»_к_торгам.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 22,
+      "message_ids": [
+        22
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T15:56:01"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_01_💰_Рекордные_дивиденды_Сбера_и_важные_решения_Минфина.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 23,
+      "message_ids": [
+        23
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T16:18:27"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_02_🔄_«Циан»_завершает_обмен_акций__последний_шанс_для_инвесторов.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 24,
+      "message_ids": [
+        24
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T16:19:42"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_03_🚀_«Фабрика_ПО»_выходит_на_Мосбиржу__новые_возможности_для_инвесторов.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 25,
+      "message_ids": [
+        25
+      ],
+      "mode": "photo",
+      "sent_at": "2026-04-23T16:19:48"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_01_💰_Дивиденды_«Сбера»_и_неопределенность_в_ФРС_США__ключевые_события_для_инвесторов.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 26,
+      "message_ids": [
+        26
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T16:34:36"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_02_🔄_«Циан»_завершает_обмен_акций__последний_шанс_для_инвесторов.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 27,
+      "message_ids": [
+        27
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T16:35:01"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_03_📈_Минфин_РФ_разместил_ОФЗ_на_215,5_млрд_рублей__высокая_доходность_привлекает_инвесторов.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 28,
+      "message_ids": [
+        28
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T16:35:04"
+    },
+    {
+      "file": "sent_posts\\2026-04-22_04_🚨_Скандал_вокруг_Hybe_(BTS)_и_выход_«Фабрики_ПО»_на_Мосбиржу.md",
+      "status": "sent",
+      "env": "test",
+      "chat_id": "@hdjsjusgwv",
+      "message_id": 29,
+      "message_ids": [
+        29
+      ],
+      "mode": "text",
+      "sent_at": "2026-04-23T16:35:08"
     }
   ],
-  "updated_at": "2026-04-22T21:34:37"
+  "updated_at": "2026-04-23T16:35:08"
 }
