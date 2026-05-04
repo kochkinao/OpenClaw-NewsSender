@@ -117,6 +117,11 @@ def get_paths(config: dict) -> dict:
     return config.get("paths", {})
 
 
+def get_lock_path(config: dict, primary_key: str, fallback_key: str | None, default: str) -> str:
+    locks = config.get("locks", {})
+    return locks.get(primary_key) or (locks.get(fallback_key) if fallback_key else None) or default
+
+
 def send_alert(config: dict, title: str, body: str, logger) -> None:
     alerts = config.get("alerts", {})
     if not alerts.get("enabled", False):
@@ -351,6 +356,29 @@ def extract_json_block(raw: str) -> str:
     return raw.strip()
 
 
+class OpenRouterAPIError(RuntimeError):
+    def __init__(self, message: str, *, diagnostic_path: str | None = None, status_code: int | None = None, response_excerpt: str | None = None):
+        super().__init__(message)
+        self.diagnostic_path = diagnostic_path
+        self.status_code = status_code
+        self.response_excerpt = response_excerpt
+
+
+def clip_text(value: str | None, limit: int = 1500) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+def save_openrouter_diagnostic(config: dict, logger, kind: str, payload: dict) -> str:
+    raw_dir = get_paths(config).get("raw_ai_dir", "raw_ai_responses")
+    ensure_dir(raw_dir)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = Path(raw_dir) / f"openrouter_{kind}_{stamp}.json"
+    save_json(str(path), payload)
+    logger.error("Диагностика OpenRouter сохранена: %s", path)
+    return str(path)
+
+
 def call_openrouter(config: dict, prompt_text: str, source_text: str, logger, system_prompt: str | None = None) -> str:
     openrouter = config["openrouter"]
     payload = {
@@ -386,10 +414,64 @@ def call_openrouter(config: dict, prompt_text: str, source_text: str, logger, sy
             json=payload,
             timeout=180,
         )
+    attempts = int(openrouter.get("response_attempts", openrouter.get("attempts", 3)) or 3)
+    delays = tuple(openrouter.get("response_retry_delays", [5, 15, 30])) or (5, 15, 30)
 
-    response = retry_request(do_request, logger)
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        response = None
+        try:
+            response = retry_request(do_request, logger)
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            if not str(content).strip():
+                raise ValueError("OpenRouter вернул пустой content")
+            return content
+        except Exception as e:
+            last_error = e
+            response_text = getattr(response, "text", "") if response is not None else ""
+            status_code = getattr(response, "status_code", None) if response is not None else None
+            diagnostic_payload = {
+                "kind": "chat_completions_error",
+                "attempt": attempt,
+                "attempts": attempts,
+                "status_code": status_code,
+                "content_type": (response.headers.get("Content-Type") if response is not None and getattr(response, "headers", None) else None),
+                "model": openrouter.get("model"),
+                "base_url": openrouter.get("base_url"),
+                "app_name": openrouter.get("app_name"),
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "response_excerpt": clip_text(response_text, 3000),
+                "prompt_excerpt": clip_text(prompt_text, 2000),
+                "system_prompt_excerpt": clip_text(system_prompt, 1200),
+                "source_excerpt": clip_text(source_text, 3000),
+                "request_payload_preview": {
+                    "temperature": payload.get("temperature"),
+                    "max_tokens": payload.get("max_tokens"),
+                    "messages_count": len(payload.get("messages", [])),
+                },
+            }
+            diagnostic_path = save_openrouter_diagnostic(config, logger, "chat", diagnostic_payload)
+            if attempt >= attempts:
+                raise OpenRouterAPIError(
+                    f"OpenRouter не вернул корректный ответ после {attempts} попыток: {e}",
+                    diagnostic_path=diagnostic_path,
+                    status_code=status_code,
+                    response_excerpt=clip_text(response_text, 500),
+                ) from e
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            logger.warning(
+                "OpenRouter attempt %s/%s завершился ошибкой: %s. Повтор через %s сек. Диагностика: %s",
+                attempt,
+                attempts,
+                e,
+                delay,
+                diagnostic_path,
+            )
+            time.sleep(delay)
+    raise last_error
 
 
 def parse_ai_posts(raw: str):
@@ -401,6 +483,77 @@ def parse_ai_posts(raw: str):
         if content:
             out.append({"title": title, "content": content})
     return out
+
+
+def normalize_post_title(title: str) -> str:
+    title = re.sub(r"\s+", " ", str(title or "").strip())
+    title = re.sub(r"^(?:📌\s*)+", "", title).strip()
+    return title or "Пост"
+
+
+def ensure_required_post_format(post: dict) -> dict:
+    title = normalize_post_title(post.get("title", "Пост"))
+    content = str(post.get("content", "")).strip()
+    if re.search(r"^\s*(?:📌\s*)+", content, flags=re.MULTILINE):
+        content = re.sub(r"^\s*(?:📌\s*)+", f"📌 {title}", content, count=1, flags=re.MULTILINE)
+    else:
+        content = f"📌 {title}\n\n{content}".strip()
+
+    section_patterns = [
+        r"📌\s+.+",
+        r"📰\s*Новость\s*:",
+        r"📊\s*Выжимка\s*:",
+        r"📉\s*Влияние на рынок\s*:",
+        r"💡\s*Как это использовать\s*:",
+        r"⚠️\s*Дисклеймер\s*:",
+    ]
+    missing_sections = [pattern for pattern in section_patterns if not re.search(pattern, content, flags=re.IGNORECASE)]
+    if missing_sections:
+        raise ValueError(f"Пост не прошёл форматную проверку, отсутствуют обязательные блоки: {len(missing_sections)}")
+
+    return {"title": title, "content": content}
+
+
+def analyze_day_signal(day_payload: dict, config: dict) -> dict:
+    validation = config.get("validation", {})
+    messages_count = int(day_payload.get("export_info", {}).get("messages_count", 0) or 0)
+    unique_texts = []
+    total_chars = 0
+    for channel in day_payload.get("channels", []):
+        for message in channel.get("messages", []):
+            text = str(message.get("text") or "").strip()
+            if not text:
+                continue
+            unique_texts.append(text)
+            total_chars += len(text)
+    min_posts = int(validation.get("min_posts", 3))
+    max_posts = int(validation.get("max_posts", 5))
+    dense_day = messages_count >= max_posts or total_chars >= 5000 or len(unique_texts) >= max_posts
+    recommended_posts = max_posts if dense_day else min_posts
+    return {
+        "messages_count": messages_count,
+        "source_chars": total_chars,
+        "dense_day": dense_day,
+        "recommended_posts": recommended_posts,
+    }
+
+
+def build_post_count_guidance(day_payload: dict, config: dict) -> str:
+    signal = analyze_day_signal(day_payload, config)
+    validation = config.get("validation", {})
+    min_posts = int(validation.get("min_posts", 3))
+    max_posts = int(validation.get("max_posts", 5))
+    if signal["dense_day"]:
+        return (
+            f"Верни от {min_posts} до {max_posts} постов. "
+            f"Сегодня данных много: ориентируйся на {max_posts} постов, если это действительно оправдано смыслом. "
+            "Не дроби одну тему на несколько слабых постов."
+        )
+    return (
+        f"Верни от {min_posts} до {max_posts} постов. "
+        f"Сегодня данных немного: собери {min_posts} сильных поста, объединяя близкие по смыслу новости. "
+        "Не растягивай день на лишние темы."
+    )
 
 
 def validate_posts(posts, config):
@@ -416,15 +569,106 @@ def validate_posts(posts, config):
 
     valid = []
     for post in posts:
-        content = post["content"]
+        normalized = ensure_required_post_format(post)
+        content = normalized["content"]
         if len(content) < min_chars:
             continue
         if len(content) > max_chars:
             content = content[:max_chars].rstrip() + "\n\n[Пост был сокращён автоматически]"
-        valid.append({"title": post["title"], "content": content})
+        valid.append({"title": normalized["title"], "content": content})
     if not valid:
         raise ValueError("После валидации не осталось корректных постов")
     return valid
+
+
+def estimate_visual_relevance(post: dict) -> int:
+    text = f"{post.get('title', '')}\n{post.get('content', '')}".lower()
+    keyword_weights = {
+        "ipo": 6,
+        "листинг": 6,
+        "мосбир": 6,
+        "бирж": 5,
+        "дивид": 5,
+        "акци": 4,
+        "облигац": 5,
+        "банк": 4,
+        "сбер": 4,
+        "доходност": 4,
+        "ставк": 4,
+        "китай": 3,
+        "технолог": 4,
+        "nvidia": 5,
+        "gold": 3,
+        "нефть": 3,
+        "газ": 3,
+        "валют": 3,
+    }
+    score = 0
+    for keyword, weight in keyword_weights.items():
+        if keyword in text:
+            score += weight
+    return score
+
+
+def fallback_image_queries(post: dict) -> list[str]:
+    text = f"{post.get('title', '')}\n{post.get('content', '')}".lower()
+    if any(token in text for token in ["ipo", "листинг", "мосбир", "бирж"]):
+        return [
+            "stock exchange trading screen ipo",
+            "technology company ipo trading floor",
+            "traders watching exchange board",
+        ]
+    if any(token in text for token in ["дивид", "банк", "сбер"]):
+        return [
+            "bank dividend stock chart",
+            "shareholders meeting finance chart",
+            "bank earnings trading screen",
+        ]
+    if any(token in text for token in ["облигац", "офз", "yield", "доходност"]):
+        return [
+            "government bonds yield chart",
+            "fixed income desk trading screen",
+            "bond market finance chart",
+        ]
+    return [
+        "financial market analysis news",
+        "stock exchange trading screen",
+        "investment market data monitor",
+    ]
+
+
+def reorder_posts_for_daily_photo(posts: list[dict], config: dict, logger) -> list[dict]:
+    rules = get_image_rules(config)
+    if not rules["daily_photo_enabled"]:
+        return posts
+    target_index = rules["daily_photo_index"] - 1
+    if target_index < 0 or target_index >= len(posts):
+        return posts
+
+    limit = rules["daily_photo_max_chars"]
+    ranked_candidates = []
+    for idx, post in enumerate(posts):
+        content_len = len(post["content"].strip())
+        if content_len > limit:
+            continue
+        ranked_candidates.append((estimate_visual_relevance(post), -content_len, idx))
+
+    if not ranked_candidates:
+        return posts
+
+    ranked_candidates.sort(reverse=True)
+    best_idx = ranked_candidates[0][2]
+    if best_idx == target_index:
+        return posts
+
+    posts[target_index], posts[best_idx] = posts[best_idx], posts[target_index]
+    logger.info(
+        "Пост #%s переставлен в daily photo slot: %s -> %s",
+        rules["daily_photo_index"],
+        best_idx + 1,
+        rules["daily_photo_index"],
+    )
+    return posts
 
 
 def rewrite_photo_slot_post(post: dict, config: dict, logger, limit: int) -> dict:
@@ -450,6 +694,7 @@ def enforce_daily_photo_post(posts: list[dict], config: dict, logger) -> list[di
     rules = get_image_rules(config)
     if not rules["daily_photo_enabled"]:
         return posts
+    posts = reorder_posts_for_daily_photo(posts, config, logger)
     index = rules["daily_photo_index"] - 1
     if index < 0 or index >= len(posts):
         return posts
@@ -458,7 +703,11 @@ def enforce_daily_photo_post(posts: list[dict], config: dict, logger) -> list[di
     content = post["content"].strip()
     if len(content) <= limit:
         return posts
-    rewritten = rewrite_photo_slot_post(post, config, logger, limit)
+    try:
+        rewritten = rewrite_photo_slot_post(post, config, logger, limit)
+    except Exception as e:
+        logger.warning("Не удалось переписать photo slot пост #%s: %s", rules["daily_photo_index"], e)
+        return posts
     if len(rewritten["content"]) <= limit:
         posts[index] = rewritten
         logger.info("Пост #%s переписан AI для daily photo slot: %s -> %s символов", rules["daily_photo_index"], len(content), len(rewritten["content"]))
@@ -510,16 +759,18 @@ def save_raw_ai_response(raw_dir: str, day_label: str, content: str) -> str:
     return str(path)
 
 
-def generate_valid_posts(config: dict, prompt_text: str, source_text: str, day_label: str, raw_dir: str, logger):
+def generate_valid_posts(config: dict, prompt_text: str, source_text: str, day_payload: dict, day_label: str, raw_dir: str, logger):
     last_error = None
     last_raw_path = None
+    guidance = build_post_count_guidance(day_payload, config)
     for attempt in range(1, 3):
-        effective_prompt = prompt_text
+        effective_prompt = prompt_text + "\n\n" + guidance
         if attempt > 1:
             effective_prompt = (
-                prompt_text
+                effective_prompt
                 + "\n\nКРИТИЧЕСКИ ВАЖНО: верни только полностью валидный JSON без markdown-блоков. "
-                + "Не обрывай строки. Если данных мало, сделай ровно 3 поста, объединив связанные новости, но не выдумывай факты."
+                + "Не обрывай строки. Нужно вернуть от 3 до 5 полноценных постов. "
+                + "Если тем мало — собери 3 сильных поста, объединив связанные новости, но не выдумывай факты."
             )
         raw = call_openrouter(config, effective_prompt, source_text, logger)
         suffix = "" if attempt == 1 else f"_attempt_{attempt}"
@@ -545,34 +796,64 @@ def save_markdown_posts(posts, out_dir: str, day_label: str, logger):
     return saved
 
 
-def build_image_query(post_text: str, config: dict, logger) -> str:
-    prompt = (
-        "Извлеки визуальный смысл финансового поста и сформулируй один поисковый запрос на английском для Pixabay. "
-        "Запрос должен быть конкретным, 5-9 слов, без кавычек. "
-        "Добавь визуальный объект и рыночный контекст: например 'software company ipo stock exchange trading screen'. "
-        "Не используй общие запросы вроде 'business', 'finance', 'money', 'stock market', 'IT company IPO' без уточнения. "
-        "Если в посте IPO/listing/Мосбиржа — обязательно используй слова stock exchange, ipo, trading screen, software или technology. "
-        "Если тема дивидендов — используй dividend, bank, shareholders, stock chart. "
-        "Если тема облигаций — используй government bonds, yield, finance chart. "
-        "Не ищи буквальные русские названия компаний; ищи тематическую рыночную иллюстрацию. "
-        "Верни только сам запрос."
-    )
-    raw = call_openrouter(config, prompt, post_text, logger, system_prompt=prompt)
-    query = re.sub(r"[^A-Za-z0-9 ,&-]+", " ", raw.strip().replace("\n", " "))
-    query = re.sub(r"\s+", " ", query).strip(" ,-")[:100]
-    generic_queries = {"business", "finance", "money", "stock market", "financial market", "it company ipo"}
-    if not query or query.lower() in generic_queries:
-        return "financial market analysis news"
+def normalize_image_query(raw: str) -> str:
+    query = re.sub(r"[^A-Za-z0-9 ,&/-]+", " ", raw.strip().replace("\n", " "))
+    query = re.sub(r"\s+", " ", query).strip(" ,-/")[:100]
     return query
 
 
-def score_pixabay_hit(hit: dict) -> tuple:
+def build_image_queries(post: dict, config: dict, logger) -> list[str]:
+    post_text = f"{post.get('title', '').strip()}\n{post.get('content', '').strip()}".strip()
+    prompt = (
+        "Извлеки визуальный смысл финансового поста и сформулируй 3 разных поисковых запроса на английском для Pixabay. "
+        "Каждый запрос должен быть конкретным, 4-8 слов, без кавычек и без нумерации. "
+        "Запросы должны отличаться визуальным объектом или ракурсом, а не только перестановкой слов. "
+        "Избегай общих формулировок вроде business, finance, money, stock market без уточнения. "
+        "Не ищи буквальные русские названия компаний; ищи тематическую рыночную иллюстрацию. "
+        "Если тема IPO/listing/биржа — используй объекты вроде trading screen, stock exchange board, tech office, traders. "
+        "Если тема дивидендов — используй dividend, bank, shareholders, stock chart. "
+        "Если тема облигаций — используй government bonds, yield chart, fixed income desk. "
+        "Верни только 3 строки, по одному запросу на строку."
+    )
+    try:
+        raw = call_openrouter(config, prompt, post_text, logger, system_prompt=prompt)
+        queries = []
+        for line in raw.splitlines():
+            query = normalize_image_query(line)
+            if query:
+                queries.append(query)
+        generic_queries = {"business", "finance", "money", "stock market", "financial market", "it company ipo"}
+        unique_queries = []
+        for query in queries:
+            if query.lower() in generic_queries:
+                continue
+            if query.lower() not in {item.lower() for item in unique_queries}:
+                unique_queries.append(query)
+        if unique_queries:
+            return unique_queries[:3]
+    except Exception as e:
+        logger.warning("AI не смог построить image queries, используем fallback: %s", e)
+    return fallback_image_queries(post)
+
+
+def score_pixabay_hit(hit: dict, query: str, recent_signatures: dict | None = None) -> tuple:
     downloads = int(hit.get("downloads", 0) or 0)
     likes = int(hit.get("likes", 0) or 0)
     comments = int(hit.get("comments", 0) or 0)
     width = int(hit.get("imageWidth", 0) or 0)
     height = int(hit.get("imageHeight", 0) or 0)
-    return (downloads + likes * 3 + comments * 2, width * height)
+    tags = (hit.get("tags") or "").lower()
+    query_words = {word for word in re.findall(r"[a-z]{4,}", query.lower()) if word not in {"market", "finance", "financial", "company"}}
+    overlap_score = sum(1 for word in query_words if word in tags)
+    author_penalty = 0
+    tag_penalty = 0
+    image_penalty = 0
+    if recent_signatures:
+        image_id = str(hit.get("id") or hit.get("pageURL") or "")
+        author_penalty = recent_signatures.get("author_penalties", {}).get(str(hit.get("user_id") or ""), 0)
+        tag_penalty = recent_signatures.get("tag_penalties", {}).get(tags, 0) if tags else 0
+        image_penalty = recent_signatures.get("image_penalties", {}).get(image_id, 0) if image_id else 0
+    return (overlap_score * 30 + downloads + likes * 3 + comments * 2 - author_penalty - tag_penalty - image_penalty, width * height)
 
 
 def is_generic_pixabay_hit(hit: dict, query: str) -> bool:
@@ -596,51 +877,143 @@ def is_generic_pixabay_hit(hit: dict, query: str) -> bool:
     return has_generic and not (has_strong or overlaps_query)
 
 
-def search_image_metadata(query: str, config: dict, logger) -> dict | None:
+def collect_recent_image_signatures(config: dict) -> dict:
+    paths = get_paths(config)
+    meta_roots = [
+        paths.get("md_output_dir", "generated_posts"),
+        paths.get("sent_posts_dir", "sent_posts"),
+        paths.get("failed_posts_dir", "failed_posts"),
+    ]
+    digest_dir = paths.get("digest_dir", "generated_digests")
+    signatures = {
+        "author_ids": set(),
+        "tags": set(),
+        "image_ids": set(),
+        "author_penalties": {},
+        "tag_penalties": {},
+        "image_penalties": {},
+    }
+    recent_meta_files = []
+    for root_dir in meta_roots:
+        root = Path(root_dir)
+        if not root.exists():
+            continue
+        recent_meta_files.extend(root.rglob("*.meta.json"))
+    digest_root = Path(digest_dir)
+    if digest_root.exists():
+        recent_meta_files.extend(digest_root.glob("*_digest.json"))
+
+    def path_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for index, meta_path in enumerate(sorted(recent_meta_files, key=path_mtime, reverse=True)[:40]):
+        try:
+            payload = load_json(str(meta_path))
+        except Exception:
+            continue
+        author_id = str(payload.get("image_author_id") or "").strip()
+        tags = str(payload.get("image_tags") or "").strip().lower()
+        image_id = str(payload.get("image_id") or payload.get("image_page_url") or payload.get("image_url") or "").strip()
+        if author_id:
+            signatures["author_ids"].add(author_id)
+        if tags:
+            signatures["tags"].add(tags)
+        if image_id:
+            signatures["image_ids"].add(image_id)
+
+        if index < 3:
+            image_weight = 1000
+            author_weight = 180
+            tag_weight = 160
+        elif index < 8:
+            image_weight = 220
+            author_weight = 80
+            tag_weight = 70
+        else:
+            image_weight = 80
+            author_weight = 30
+            tag_weight = 25
+
+        if image_id:
+            signatures["image_penalties"][image_id] = max(signatures["image_penalties"].get(image_id, 0), image_weight)
+        if author_id:
+            signatures["author_penalties"][author_id] = max(signatures["author_penalties"].get(author_id, 0), author_weight)
+        if tags:
+            signatures["tag_penalties"][tags] = max(signatures["tag_penalties"].get(tags, 0), tag_weight)
+    return signatures
+
+
+def search_image_metadata(queries: list[str], config: dict, logger) -> dict | None:
     image_search = config.get("image_search", {})
     if not image_search.get("enabled", False):
         return None
     if image_search.get("provider", "").lower() != "pixabay":
         raise ValueError("Поддержан только Pixabay")
-    params = {
-        "key": image_search.get("api_key"),
-        "q": query,
-        "lang": image_search.get("lang", "ru"),
-        "image_type": image_search.get("image_type", "photo"),
-        "orientation": image_search.get("orientation", "horizontal"),
-        "category": image_search.get("category", "business"),
-        "safesearch": str(image_search.get("safesearch", True)).lower(),
-        "order": image_search.get("order", "popular"),
-        "page": 1,
-        "per_page": image_search.get("per_page", 5),
-    }
+    recent_signatures = collect_recent_image_signatures(config)
+    orientations = []
+    preferred_orientation = image_search.get("orientation", "horizontal")
+    for value in [preferred_orientation, "horizontal", "vertical"]:
+        if value and value not in orientations:
+            orientations.append(value)
 
-    def do_request():
-        return requests.get("https://pixabay.com/api/", params=params, timeout=60)
+    best_hit = None
+    best_query = None
+    best_orientation = None
+    for query in queries:
+        for orientation in orientations:
+            params = {
+                "key": image_search.get("api_key"),
+                "q": query,
+                "lang": image_search.get("lang", "ru"),
+                "image_type": image_search.get("image_type", "photo"),
+                "orientation": orientation,
+                "category": image_search.get("category", "business"),
+                "safesearch": str(image_search.get("safesearch", True)).lower(),
+                "order": image_search.get("order", "popular"),
+                "page": 1,
+                "per_page": max(int(image_search.get("per_page", 5)), 15),
+            }
 
-    response = retry_request(do_request, logger)
-    response.raise_for_status()
-    data = response.json()
-    hits = data.get("hits", []) or []
-    if not hits:
+            def do_request():
+                return requests.get("https://pixabay.com/api/", params=params, timeout=60)
+
+            response = retry_request(do_request, logger)
+            response.raise_for_status()
+            data = response.json()
+            hits = data.get("hits", []) or []
+            filtered_hits = [hit for hit in hits if not is_generic_pixabay_hit(hit, query)]
+            if not filtered_hits:
+                continue
+            filtered_hits = sorted(filtered_hits, key=lambda hit: score_pixabay_hit(hit, query, recent_signatures), reverse=True)
+            candidate = filtered_hits[0]
+            candidate_score = score_pixabay_hit(candidate, query, recent_signatures)
+            if best_hit is None or candidate_score > score_pixabay_hit(best_hit, best_query or query, recent_signatures):
+                best_hit = candidate
+                best_query = query
+                best_orientation = orientation
+
+    if not best_hit:
+        logger.warning("Pixabay не дал релевантных картинок для запросов: %s", "; ".join(queries))
         return None
-    filtered_hits = [hit for hit in hits if not is_generic_pixabay_hit(hit, query)]
-    if not filtered_hits:
-        logger.warning("Pixabay не дал релевантных картинок для запроса '%s'", query)
-        return None
-    hits = sorted(filtered_hits, key=score_pixabay_hit, reverse=True)
-    best = hits[0]
+
+    best = best_hit
     image_url = best.get("largeImageURL") or best.get("webformatURL")
     if not image_url:
         return None
     return {
         "provider": "pixabay",
-        "image_query": query,
+        "image_query": best_query,
+        "image_queries": queries,
+        "image_orientation": best_orientation,
         "image_url": image_url,
         "page_url": best.get("pageURL"),
         "author": best.get("user"),
         "author_id": best.get("user_id"),
         "tags": best.get("tags"),
+        "image_id": best.get("id"),
     }
 
 
@@ -698,7 +1071,7 @@ async def main():
     config = load_json(args.config)
     paths = get_paths(config)
     logger = setup_logging("get_posts", paths.get("log_dir", "logs"), config.get("runtime", {}).get("log_level", "INFO"), "export.log")
-    lock_path = config.get("locks", {}).get("get_posts", "locks/get_posts.lock")
+    lock_path = get_lock_path(config, "get_posts", "collect", "locks/get_posts.lock")
 
     with LockFile(lock_path):
         try:
@@ -754,6 +1127,7 @@ async def main():
                                 config,
                                 prompt_text,
                                 build_ai_payload(payload),
+                                payload,
                                 day_label,
                                 paths.get("raw_ai_dir", "raw_ai_responses"),
                                 logger,
@@ -763,14 +1137,18 @@ async def main():
                             saved = save_markdown_posts(posts, md_output_dir, day_label, logger)
 
                             for idx, (md_path, post) in enumerate(zip(saved, posts), start=1):
+                                image_rules = get_image_rules(config)
                                 metadata = {
                                     "image_enabled": False,
-                                    "image_policy": "daily_photo_slot" if idx == get_image_rules(config)["daily_photo_index"] else "short_post_only",
+                                    "image_policy": "daily_photo_slot" if idx == image_rules["daily_photo_index"] else "short_post_only",
                                     "image_query": None,
+                                    "image_queries": [],
                                     "image_url": None,
                                     "local_image_path": None,
                                     "image_skipped_reason": None,
                                     "post_chars": len(post["content"].strip()),
+                                    "photo_slot_requested": idx == image_rules["daily_photo_index"],
+                                    "photo_slot_ready": idx == image_rules["daily_photo_index"] and len(post["content"].strip()) <= image_rules["daily_photo_max_chars"],
                                 }
 
                                 skip_reason = "skip_images_cli" if args.skip_images else get_image_skip_reason(post["content"], config, idx)
@@ -781,20 +1159,23 @@ async def main():
                                     continue
 
                                 try:
-                                    image_query = build_image_query(post["content"], config, logger)
-                                    metadata["image_query"] = image_query
-                                    image_meta = search_image_metadata(image_query, config, logger)
+                                    image_queries = build_image_queries(post, config, logger)
+                                    metadata["image_queries"] = image_queries
+                                    image_meta = search_image_metadata(image_queries, config, logger)
 
                                     if image_meta:
                                         metadata.update({
                                             "image_enabled": True,
                                             "image_query": image_meta.get("image_query"),
+                                            "image_queries": image_meta.get("image_queries", image_queries),
                                             "image_url": image_meta.get("image_url"),
                                             "image_provider": image_meta.get("provider"),
                                             "image_page_url": image_meta.get("page_url"),
                                             "image_author": image_meta.get("author"),
                                             "image_author_id": image_meta.get("author_id"),
                                             "image_tags": image_meta.get("tags"),
+                                            "image_id": image_meta.get("image_id"),
+                                            "image_orientation": image_meta.get("image_orientation"),
                                         })
 
                                         if config.get("image_storage", {}).get("enabled", True) and config.get("image_storage", {}).get("download", True):
@@ -825,18 +1206,31 @@ async def main():
                             move_file(json_path, str(Path(archive_dir) / day_label), logger)
 
                     except Exception as e:
+                        diagnostic_path = getattr(e, "diagnostic_path", None)
                         day_state["generation"] = {
                             "status": "failed",
                             "posts_created": 0,
                             "md_paths": [],
                             "raw_ai_path": None,
                             "error": str(e),
+                            "diagnostic_path": diagnostic_path,
                         }
                         logger.exception("Ошибка генерации за %s: %s", day_label, e)
-                        send_alert(config, "Ошибка генерации постов", f"Дата: {day_label}\nОшибка: {e}", logger)
+                        alert_lines = [f"Дата: {day_label}", f"Ошибка: {e}"]
+                        if diagnostic_path:
+                            alert_lines.append(f"Диагностика: {diagnostic_path}")
+                        if getattr(e, "status_code", None):
+                            alert_lines.append(f"HTTP: {e.status_code}")
+                        if getattr(e, "response_excerpt", None):
+                            alert_lines.append(f"Ответ: {e.response_excerpt}")
+                        send_alert(config, "Ошибка генерации постов", "\n".join(alert_lines), logger)
             
             save_state(state_path, state)
-            logger.info("get_posts.py завершён успешно")
+            failed_days = [label for label, payload in state.get("days", {}).items() if payload.get("generation", {}).get("status") == "failed"]
+            if failed_days:
+                logger.warning("get_posts.py завершён с ошибками генерации: %s", ", ".join(failed_days))
+            else:
+                logger.info("get_posts.py завершён успешно")
 
         except Exception as e:
             logger.exception("Критическая ошибка get_posts.py: %s", e)

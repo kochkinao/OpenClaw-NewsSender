@@ -6,10 +6,12 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
+from html import escape
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
+from get_posts import build_image_queries, download_image, search_image_metadata
 
 
 def ensure_dir(path: str) -> None:
@@ -117,6 +119,11 @@ def get_paths(config: dict) -> dict:
     return config.get("paths", {})
 
 
+def get_lock_path(config: dict, primary_key: str, fallback_key: str | None, default: str) -> str:
+    locks = config.get("locks", {})
+    return locks.get(primary_key) or (locks.get(fallback_key) if fallback_key else None) or default
+
+
 def send_alert(config: dict, title: str, body: str, logger) -> None:
     alerts = config.get("alerts", {})
     if not alerts.get("enabled", False):
@@ -141,13 +148,7 @@ def send_alert(config: dict, title: str, body: str, logger) -> None:
             logger.error("Ошибка отправки alert (%s): %s", chat_id, e)
 
 import argparse
-import asyncio
 import socket
-import struct
-import zlib
-
-from telethon import TelegramClient, functions, types, utils
-from telethon.errors import RPCError
 
 TELEGRAM_HARD_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
@@ -261,6 +262,148 @@ def get_photo_post_limit(config: dict) -> int:
     return int(validation.get("photo_caption_limit", image_search.get("max_post_chars", DEFAULT_PHOTO_POST_LIMIT)))
 
 
+def shorten_text(value: str | None, limit: int = 500) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def format_context_lines(context: dict) -> str:
+    lines = []
+    for key, value in context.items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, (list, tuple, set)):
+            value = ", ".join(str(item) for item in value)
+        lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def build_post_link(chat_id: str | None, message_id: int | None) -> str | None:
+    if not chat_id or not message_id:
+        return None
+    chat_id = str(chat_id).strip()
+    if chat_id.startswith("@"):
+        return f"https://t.me/{chat_id[1:]}/{message_id}"
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", chat_id):
+        return f"https://t.me/{chat_id}/{message_id}"
+    return None
+
+
+def strip_html_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "")
+
+
+class OpenRouterAPIError(RuntimeError):
+    def __init__(self, message: str, *, diagnostic_path: str | None = None, status_code: int | None = None, response_excerpt: str | None = None):
+        super().__init__(message)
+        self.diagnostic_path = diagnostic_path
+        self.status_code = status_code
+        self.response_excerpt = response_excerpt
+
+
+def clip_text(value: str | None, limit: int = 1500) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+def save_openrouter_diagnostic(config: dict, logger, kind: str, payload: dict) -> str:
+    digest_dir = get_paths(config).get("digest_dir") or get_paths(config).get("log_dir", "logs")
+    ensure_dir(digest_dir)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = Path(digest_dir) / f"openrouter_{kind}_{stamp}.json"
+    save_json(str(path), payload)
+    logger.error("Диагностика OpenRouter сохранена: %s", path)
+    return str(path)
+
+
+def call_openrouter(config: dict, prompt_text: str, source_text: str, logger, system_prompt: str | None = None) -> str:
+    openrouter = config["openrouter"]
+    payload = {
+        "model": openrouter.get("model", "google/gemini-2.5-flash"),
+        "temperature": openrouter.get("temperature", 0.4),
+        "max_tokens": min(int(openrouter.get("max_tokens", 4000)), 2500),
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt or "Ты редактор финансового Telegram-канала. Верни только итоговый текст без пояснений.",
+            },
+            {
+                "role": "user",
+                "content": f"{prompt_text}\n\nИсходные данные:\n{source_text}",
+            },
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {openrouter['api_key']}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": openrouter.get("site_url") or "https://localhost",
+        "X-Title": openrouter.get("app_name", "tgpost"),
+    }
+
+    def do_request():
+        return requests.post(
+            openrouter.get("base_url", "https://openrouter.ai/api/v1/chat/completions"),
+            headers=headers,
+            json=payload,
+            timeout=180,
+        )
+    attempts = int(openrouter.get("response_attempts", openrouter.get("attempts", 3)) or 3)
+    delays = tuple(openrouter.get("response_retry_delays", [5, 15, 30])) or (5, 15, 30)
+
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        response = None
+        try:
+            response = retry_request(do_request, logger)
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            if not str(content).strip():
+                raise ValueError("OpenRouter вернул пустой content")
+            return content
+        except Exception as e:
+            last_error = e
+            response_text = getattr(response, "text", "") if response is not None else ""
+            status_code = getattr(response, "status_code", None) if response is not None else None
+            diagnostic_payload = {
+                "kind": "chat_completions_error",
+                "attempt": attempt,
+                "attempts": attempts,
+                "status_code": status_code,
+                "content_type": (response.headers.get("Content-Type") if response is not None and getattr(response, "headers", None) else None),
+                "model": openrouter.get("model"),
+                "base_url": openrouter.get("base_url"),
+                "app_name": openrouter.get("app_name"),
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "response_excerpt": clip_text(response_text, 3000),
+                "prompt_excerpt": clip_text(prompt_text, 2000),
+                "system_prompt_excerpt": clip_text(system_prompt, 1200),
+                "source_excerpt": clip_text(source_text, 3000),
+            }
+            diagnostic_path = save_openrouter_diagnostic(config, logger, "digest", diagnostic_payload)
+            if attempt >= attempts:
+                raise OpenRouterAPIError(
+                    f"OpenRouter не вернул корректный ответ после {attempts} попыток: {e}",
+                    diagnostic_path=diagnostic_path,
+                    status_code=status_code,
+                    response_excerpt=clip_text(response_text, 500),
+                ) from e
+            delay = delays[min(attempt - 1, len(delays) - 1)]
+            logger.warning(
+                "OpenRouter attempt %s/%s завершился ошибкой: %s. Повтор через %s сек. Диагностика: %s",
+                attempt,
+                attempts,
+                e,
+                delay,
+                diagnostic_path,
+            )
+            time.sleep(delay)
+    raise last_error
+
+
 def is_permanent_telegram_error(status_code: int, response_text: str) -> bool:
     lowered = response_text.lower()
     markers = ["chat not found", "bot is not a member", "bot is not an administrator", "forbidden", "unauthorized", "invalid token"]
@@ -319,13 +462,490 @@ def save_publication_metadata(meta_path: str | None, publication: dict) -> None:
     save_json(meta_path, payload)
 
 
+def extract_post_title(post_text: str, fallback: str = "Пост") -> str:
+    for line in post_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        return line.replace("📌", "").strip(" -—\t")[:120] or fallback
+    return fallback
+
+
+def strip_leading_symbols(text: str) -> str:
+    return re.sub(r"^[^\wА-Яа-яЁё]+", "", text, flags=re.UNICODE).strip()
+
+
+def format_russian_date(date_obj) -> str:
+    months = {
+        1: "января",
+        2: "февраля",
+        3: "марта",
+        4: "апреля",
+        5: "мая",
+        6: "июня",
+        7: "июля",
+        8: "августа",
+        9: "сентября",
+        10: "октября",
+        11: "ноября",
+        12: "декабря",
+    }
+    return f"{date_obj.day} {months[date_obj.month]} {date_obj.year} года"
+
+
+def normalize_digest_title(title: str) -> str:
+    title = strip_leading_symbols(title.replace("📌", "").strip())
+    title = re.sub(r"^(новость|что случилось|пост)\s*:\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip(" .:-") or "Важная новость"
+
+
+def inject_link_into_one_word(title: str, link: str) -> str:
+    words = title.split()
+    if not words:
+        return f'<a href="{escape(link, quote=True)}">подробнее</a>'
+
+    preferred_index = len(words) // 2
+    stop_words = {
+        "и", "в", "во", "на", "по", "с", "со", "для", "от", "до", "из", "к", "ко",
+        "у", "о", "об", "под", "при", "но", "или", "а", "не", "что", "это",
+    }
+    keyword_roots = [
+        "индекс", "инвест", "дивид", "доход", "крипт", "минфин", "сбер", "офз",
+        "банк", "акц", "облигац", "ipo", "бирж", "технолог", "выруч", "рын",
+        "налог", "недвиж", "ии", "nvidia", "amazon", "positive", "cyан", "циан",
+    ]
+
+    ranked = []
+    for idx, word in enumerate(words):
+        clean_word = re.sub(r"[^\wА-Яа-яЁё-]+", "", word, flags=re.UNICODE)
+        lowered = clean_word.lower()
+        if not lowered or lowered in stop_words:
+            continue
+        score = 0
+        if any(root in lowered for root in keyword_roots):
+            score += 100
+        if len(clean_word) >= 10:
+            score += 20
+        elif len(clean_word) >= 7:
+            score += 12
+        elif len(clean_word) >= 5:
+            score += 6
+        if re.search(r"[A-ZА-ЯЁ]", clean_word):
+            score += 12
+        score -= abs(idx - preferred_index)
+        ranked.append((score, idx))
+
+    if ranked:
+        ranked.sort(reverse=True)
+        chosen_index = ranked[0][1]
+    else:
+        chosen_index = min(preferred_index, len(words) - 1)
+
+    escaped_words = [escape(word) for word in words]
+    escaped_words[chosen_index] = f'<a href="{escape(link, quote=True)}">{escaped_words[chosen_index]}</a>'
+    return " ".join(escaped_words)
+
+
+def should_send_digest(config: dict, env_name: str, post_filename: str, state: dict) -> bool:
+    daily_digest = config.get("content", {}).get("daily_digest", {})
+    if not daily_digest.get("enabled", False):
+        return False
+    if "_01_" not in post_filename:
+        return False
+    day_label = post_filename[:10]
+    digest_state = state.get("days", {}).get(day_label, {}).get("digest", {})
+    if not digest_state.get(f"attempted_{env_name}", False):
+        return True
+    status = digest_state.get(f"status_{env_name}")
+    reason = digest_state.get(f"reason_{env_name}")
+    if status == "skipped" and reason in {"no_source_posts", "no_source_posts_in_lookback"}:
+        return True
+    return False
+
+
+def collect_digest_source_posts(state: dict, day_label: str, env_name: str, max_items: int) -> list[dict]:
+    by_file = {}
+    for entry in state.get("send_queue", []):
+        if entry.get("status") != "sent" or entry.get("env") != env_name:
+            continue
+        file_name = Path(str(entry.get("file") or "")).name
+        if not file_name.startswith(day_label):
+            continue
+        by_file[file_name] = entry
+
+    items = []
+    for file_name in sorted(by_file):
+        entry = by_file[file_name]
+        file_path = Path(str(entry.get("file") or ""))
+        text = ""
+        if file_path.exists():
+            text = file_path.read_text(encoding="utf-8").strip()
+        title = extract_post_title(text, fallback=file_path.stem if file_path.stem else file_name)
+        link = build_post_link(entry.get("chat_id"), entry.get("message_id"))
+        items.append({
+            "file_name": file_name,
+            "file_path": str(file_path),
+            "title": title,
+            "text": text,
+            "link": link,
+            "message_id": entry.get("message_id"),
+        })
+    return items[:max_items]
+
+
+def find_digest_source_day(state: dict, target_day_label: str, env_name: str, lookback_days: int = 7) -> str | None:
+    target_date = datetime.strptime(target_day_label, "%Y-%m-%d").date()
+    for offset in range(1, max(lookback_days, 1) + 1):
+        candidate = (target_date - timedelta(days=offset)).isoformat()
+        if collect_digest_source_posts(state, candidate, env_name, 1):
+            return candidate
+    return None
+
+
+def extract_digest_summary_fallback(item: dict) -> str:
+    text = strip_markdown_for_story(item.get("text") or "")
+    lines = [line.strip(" -—\t") for line in text.splitlines() if line.strip()]
+    title = normalize_digest_title(item.get("title") or "")
+    content_lines = []
+    for line in lines[1:]:
+        lowered = line.lower()
+        if lowered.startswith(("новость:", "выжимка:", "влияние на рынок:", "как это использовать:", "дисклеймер:")):
+            continue
+        if line.startswith(("📰", "📊", "📉", "💡", "⚠️")):
+            line = strip_leading_symbols(line)
+        line = re.sub(r"^(новость|выжимка|влияние на рынок|как это использовать|дисклеймер)\s*:\s*", "", line, flags=re.IGNORECASE)
+        if line:
+            content_lines.append(line)
+    summary_body = ""
+    if content_lines:
+        summary_body = normalize_digest_title(shorten_text(" ".join(content_lines), 120))
+    if summary_body and not summary_body.lower().startswith(title.lower()):
+        return f"{title}: {summary_body}"
+    if summary_body:
+        return summary_body
+    return title
+
+
+def extract_json_block(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    elif raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    return raw.strip()
+
+
+def parse_digest_summary_json(raw: str, expected_count: int) -> list[str]:
+    payload = json.loads(extract_json_block(raw))
+    items = payload.get("items", [])
+    result = []
+    for item in items:
+        summary = normalize_digest_title(str(item.get("summary", "")).strip())
+        if summary:
+            result.append(summary)
+    if len(result) != expected_count:
+        raise ValueError(f"AI вернул {len(result)} digest summaries вместо {expected_count}")
+    return result
+
+
+def build_digest_summaries(items: list[dict], config: dict, logger) -> tuple[list[str], str]:
+    source_lines = []
+    for idx, item in enumerate(items, start=1):
+        source_lines.append(f"[{idx}] Заголовок: {item['title']}")
+        source_lines.append(shorten_text(item.get("text") or item["title"], 1600))
+        source_lines.append("")
+
+    prompt = (
+        "Ты делаешь короткий утренний дайджест по уже опубликованным постам Telegram-канала. "
+        "Для каждого поста верни ОДНУ короткую строку на русском языке: это должна быть нормальная человеческая формулировка сути новости. "
+        "Не используй шаблоны вроде 'Новость', 'Что случилось', 'Пост'. "
+        "Не пиши вводные слова. Не ставь кавычки. Не добавляй ссылки. "
+        "Каждая строка должна быть 5-14 слов, по возможности в одно предложение. "
+        "Верни строго JSON вида {\"items\":[{\"summary\":\"...\"}]} в том же порядке."
+    )
+
+    try:
+        raw = call_openrouter(config, prompt, "\n".join(source_lines), logger, system_prompt=prompt)
+        return parse_digest_summary_json(raw, len(items)), "ai"
+    except Exception as e:
+        logger.warning("AI не смог сделать digest summaries, fallback на локальную выжимку: %s", e)
+        return [extract_digest_summary_fallback(item) for item in items], "fallback"
+
+
+def build_digest_lines(items: list[dict], summaries: list[str]) -> tuple[list[str], list[str]]:
+    telegram_lines = []
+    plain_lines = []
+    for item, summary in zip(items, summaries):
+        line_text = normalize_digest_title(summary)
+        if item.get("link"):
+            telegram_lines.append(f"👉 {inject_link_into_one_word(line_text, item['link'])}")
+            plain_lines.append(f"👉 {line_text}\nПодробнее: {item['link']}")
+        else:
+            telegram_lines.append(f"👉 {escape(line_text)}")
+            plain_lines.append(f"👉 {line_text}")
+    return telegram_lines, plain_lines
+
+
+def get_digest_dir(config: dict) -> str:
+    paths = get_paths(config)
+    return paths.get("digest_dir", "generated_digests")
+
+
+def save_digest_artifacts(config: dict, target_day_label: str, telegram_message: str, plain_message: str, meta: dict, logger) -> dict:
+    digest_dir = Path(get_digest_dir(config))
+    ensure_dir(str(digest_dir))
+    txt_path = digest_dir / f"{target_day_label}_digest.txt"
+    telegram_path = digest_dir / f"{target_day_label}_digest.telegram.html"
+    json_path = digest_dir / f"{target_day_label}_digest.json"
+    txt_path.write_text(plain_message.strip() + "\n", encoding="utf-8")
+    telegram_path.write_text(telegram_message.strip() + "\n", encoding="utf-8")
+    payload = dict(meta)
+    payload["telegram_message"] = telegram_message
+    payload["plain_message"] = plain_message
+    save_json(str(json_path), payload)
+    logger.info("Digest сохранён: %s", txt_path)
+    return {"text_path": str(txt_path), "telegram_path": str(telegram_path), "json_path": str(json_path)}
+
+
+def prepare_digest_image(config: dict, target_day_label: str, items: list[dict], logger) -> dict | None:
+    image_search = config.get("image_search", {})
+    if not image_search.get("enabled", False):
+        return None
+    digest_post = {
+        "title": "Digest financial market news",
+        "content": "\n".join(normalize_digest_title(item["title"]) for item in items[:6]),
+    }
+    queries = build_image_queries(digest_post, config, logger)
+    image_meta = search_image_metadata(queries, config, logger)
+    if not image_meta:
+        return None
+
+    local_image_path = None
+    if config.get("image_storage", {}).get("enabled", True) and config.get("image_storage", {}).get("download", True):
+        digest_media_dir = str(Path(get_digest_dir(config)) / target_day_label)
+        local_image_path = download_image(image_meta["image_url"], digest_media_dir, target_day_label, 0, logger)
+
+    return {
+        "image_enabled": True,
+        "image_query": image_meta.get("image_query"),
+        "image_queries": image_meta.get("image_queries", queries),
+        "image_url": image_meta.get("image_url"),
+        "image_provider": image_meta.get("provider"),
+        "image_page_url": image_meta.get("page_url"),
+        "image_author": image_meta.get("author"),
+        "image_author_id": image_meta.get("author_id"),
+        "image_tags": image_meta.get("tags"),
+        "image_id": image_meta.get("image_id"),
+        "local_image_path": local_image_path,
+    }
+
+
+def build_daily_digest_message(config: dict, state: dict, env_name: str, target_day_label: str, logger) -> tuple[dict | None, dict]:
+    daily_digest = config.get("content", {}).get("daily_digest", {})
+    source_day_label = find_digest_source_day(
+        state,
+        target_day_label,
+        env_name,
+        int(daily_digest.get("lookback_days", 7) or 7),
+    )
+    if not source_day_label:
+        return None, {"source_day_label": None, "items_count": 0, "items": []}
+
+    items = collect_digest_source_posts(state, source_day_label, env_name, int(daily_digest.get("max_items", 10) or 10))
+    meta = {"source_day_label": source_day_label, "items_count": len(items), "items": items}
+    if not items:
+        return None, meta
+
+    intro = daily_digest.get("intro", "").strip() or "Важные финансовые новости, которые вы могли пропустить вчера"
+    source_date = datetime.strptime(source_day_label, "%Y-%m-%d").date()
+    header = f"{intro}, {format_russian_date(source_date)}:"
+    summaries, summary_source = build_digest_summaries(items, config, logger)
+    telegram_lines, plain_lines = build_digest_lines(items, summaries)
+    telegram_message = f"{escape(header)}\n\n" + "\n\n".join(telegram_lines)
+    plain_message = f"{header}\n\n" + "\n\n".join(plain_lines)
+    meta["summary_source"] = summary_source
+    meta["summaries"] = summaries
+    image_meta = prepare_digest_image(config, target_day_label, items, logger)
+    if image_meta:
+        meta["image"] = image_meta
+    payload = {
+        "telegram_message": telegram_message[:3900],
+        "plain_message": plain_message[:3900],
+        "image": image_meta,
+    }
+    return payload, meta
+
+
+def mark_digest_result(state: dict, env_name: str, day_label: str, status: str, **extra) -> None:
+    digest_state = state.setdefault("days", {}).setdefault(day_label, {}).setdefault("digest", {})
+    suffix = f"_{env_name}"
+    for key in [item for item in list(digest_state.keys()) if item.endswith(suffix)]:
+        digest_state.pop(key, None)
+    digest_state[f"attempted_{env_name}"] = True
+    digest_state[f"status_{env_name}"] = status
+    digest_state[f"updated_at_{env_name}"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for key, value in extra.items():
+        digest_state[f"{key}_{env_name}"] = value
+
+
+def send_digest_message(bot_token: str, chat_id: str, digest_payload: dict, logger, disable_web_page_preview: bool = False) -> tuple[bool, dict]:
+    text = digest_payload["telegram_message"]
+    image_meta = digest_payload.get("image") or {}
+    details = {"stage": "digest", "chars": len(strip_html_tags(text)), "chat_id": chat_id}
+    image_source = None
+    if image_meta.get("local_image_path") and Path(image_meta["local_image_path"]).exists():
+        image_source = image_meta["local_image_path"]
+    elif image_meta.get("image_url"):
+        image_source = image_meta["image_url"]
+    details["image_source"] = image_source
+    details["image_query"] = image_meta.get("image_query")
+
+    try:
+        if image_source:
+            response = retry_request(
+                lambda: send_photo(bot_token, chat_id, image_source, text, "HTML", None),
+                logger,
+            )
+            details["mode"] = "photo"
+        else:
+            response = retry_request(
+                lambda: send_message(bot_token, chat_id, text, "HTML", disable_web_page_preview, None),
+                logger,
+            )
+            details["mode"] = "text"
+    except Exception as e:
+        details["exception"] = str(e)
+        return False, details
+
+    details["status_code"] = response.status_code
+    details["response_text"] = shorten_text(response.text, 700)
+    if not response.ok:
+        return False, details
+    details["message_id"] = extract_message_id(response)
+    return True, details
+
+
+def should_publish_vk_digest(config: dict) -> bool:
+    targets = {str(item).lower() for item in config.get("publish_targets", [])}
+    if "vk" not in targets:
+        return False
+    vk_cfg = config.get("vk", {})
+    group_id = int(vk_cfg.get("group_id") or 0)
+    if group_id in {0, 123456789}:
+        return False
+    return bool(vk_cfg.get("access_token") and group_id)
+
+
+def vk_api_call(config: dict, method: str, params: dict, logger) -> dict:
+    vk_cfg = config.get("vk", {})
+    request_params = dict(params)
+    request_params["access_token"] = vk_cfg.get("access_token")
+    request_params["v"] = vk_cfg.get("api_version", "5.199")
+
+    def do_request():
+        return requests.post(f"https://api.vk.com/method/{method}", data=request_params, timeout=120)
+
+    response = retry_request(do_request, logger)
+    response.raise_for_status()
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError(f"VK API {method}: {data['error']}")
+    return data.get("response", {})
+
+
+def upload_vk_wall_photo(config: dict, image_path: str, logger) -> str:
+    vk_cfg = config.get("vk", {})
+    group_id = int(vk_cfg.get("group_id"))
+    upload_server = vk_api_call(config, "photos.getWallUploadServer", {"group_id": group_id}, logger)
+    upload_url = upload_server.get("upload_url")
+    if not upload_url:
+        raise RuntimeError("VK не вернул upload_url для wall photo")
+
+    with open(image_path, "rb") as image_file:
+        upload_response = retry_request(lambda: requests.post(upload_url, files={"photo": image_file}, timeout=180), logger)
+    upload_response.raise_for_status()
+    upload_payload = upload_response.json()
+    if upload_payload.get("error"):
+        raise RuntimeError(f"VK upload error: {upload_payload['error']}")
+
+    saved = vk_api_call(
+        config,
+        "photos.saveWallPhoto",
+        {
+            "group_id": group_id,
+            "photo": upload_payload.get("photo"),
+            "server": upload_payload.get("server"),
+            "hash": upload_payload.get("hash"),
+        },
+        logger,
+    )
+    if not saved:
+        raise RuntimeError("VK не вернул данные сохранённого фото")
+    photo = saved[0]
+    return f"photo{photo['owner_id']}_{photo['id']}"
+
+
+def send_digest_to_vk(config: dict, digest_payload: dict, logger) -> tuple[bool, dict]:
+    vk_cfg = config.get("vk", {})
+    details = {
+        "stage": "digest_vk",
+        "group_id": vk_cfg.get("group_id"),
+        "chars": len(digest_payload.get("plain_message", "")),
+    }
+    message = digest_payload.get("plain_message", "").strip()
+    if not message:
+        details["exception"] = "empty_digest_message"
+        return False, details
+
+    params = {
+        "owner_id": -abs(int(vk_cfg.get("group_id"))),
+        "from_group": 1,
+        "message": message[:4000],
+    }
+
+    image_meta = digest_payload.get("image") or {}
+    image_path = image_meta.get("local_image_path")
+    details["image_path"] = image_path
+    details["image_query"] = image_meta.get("image_query")
+    try:
+        if image_path and Path(image_path).exists():
+            attachment = upload_vk_wall_photo(config, image_path, logger)
+            params["attachments"] = attachment
+            details["attachment"] = attachment
+            details["mode"] = "photo"
+        else:
+            details["mode"] = "text"
+        response = vk_api_call(config, "wall.post", params, logger)
+        details["post_id"] = response.get("post_id")
+        return True, details
+    except Exception as e:
+        details["exception"] = str(e)
+        return False, details
+
+
 def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config: dict, env_cfg: dict, disable_web_page_preview=False):
     text = file_path.read_text(encoding="utf-8").strip()
+    metadata = load_post_metadata(file_path)
+    details = {
+        "file": str(file_path),
+        "file_name": file_path.name,
+        "chat_id": chat_id,
+        "post_chars": len(text),
+        "image_enabled": bool(metadata.get("image_enabled", False)),
+        "image_query": metadata.get("image_query"),
+        "image_queries": metadata.get("image_queries"),
+        "image_skipped_reason": metadata.get("image_skipped_reason"),
+        "photo_slot_requested": metadata.get("photo_slot_requested"),
+        "photo_slot_ready": metadata.get("photo_slot_ready"),
+    }
     if not text:
-        return False, "empty_file", {}
+        details["stage"] = "read_post"
+        return False, "empty_file", details
 
     reply_markup = build_reply_markup(config, env_cfg)
-    metadata = load_post_metadata(file_path)
     image_enabled = bool(metadata.get("image_enabled", False))
     local_image_path = metadata.get("local_image_path") if image_enabled else None
     image_url = metadata.get("image_url") if image_enabled else None
@@ -335,6 +955,9 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
         image_source = local_image_path
     elif image_url:
         image_source = image_url
+    details["local_image_path"] = local_image_path
+    details["image_url"] = image_url
+    details["resolved_image_source"] = image_source
 
     photo_post_limit = get_photo_post_limit(config)
     if image_source and len(text) > photo_post_limit:
@@ -343,12 +966,15 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
             len(text),
             photo_post_limit,
         )
+        details["image_dropped_reason"] = f"caption_limit:{len(text)}>{photo_post_limit}"
         image_source = None
 
     logger.info("Пытаюсь отправить пост: %s | image: %s | кнопка: %s", file_path.name, "yes" if image_source else "no", "enabled" if reply_markup else "disabled")
 
     if image_source:
         caption = text[:TELEGRAM_CAPTION_LIMIT].strip()
+        details["stage"] = "send_photo"
+        details["caption_chars"] = len(caption)
 
         def photo_request():
             return send_photo(bot_token, chat_id, image_source, caption, "Markdown", reply_markup)
@@ -357,20 +983,28 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
             photo_response = retry_request(photo_request, logger)
         except Exception as e:
             logger.warning("sendPhoto не удался: %s", e)
+            details["photo_exception"] = str(e)
             photo_response = None
 
         if photo_response is not None and photo_response.ok:
             message_id = extract_message_id(photo_response)
-            return True, None, {"message_ids": [message_id] if message_id else [], "mode": "photo"}
+            details["status_code"] = photo_response.status_code
+            details["message_id"] = message_id
+            return True, None, {"message_ids": [message_id] if message_id else [], "mode": "photo", "debug": details}
 
         status = photo_response.status_code if photo_response is not None else 0
         body = photo_response.text if photo_response is not None else "no response"
+        details["photo_status_code"] = status
+        details["photo_response_text"] = shorten_text(body, 700)
         logger.warning("sendPhoto не сработал, fallback на text. status=%s body=%s", status, body)
         if is_permanent_telegram_error(status, body):
-            return False, f"permanent_error: {body[:300]}", {}
+            details["stage"] = "send_photo"
+            return False, "permanent_error", details
 
     parts = split_text_for_telegram(text)
     message_ids = []
+    details["text_parts"] = len(parts)
+    details["stage"] = "send_text_markdown"
     for part in parts:
         def markdown_request():
             return send_message(bot_token, chat_id, part, "Markdown", disable_web_page_preview, reply_markup)
@@ -378,6 +1012,7 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
             response = retry_request(markdown_request, logger)
         except Exception as e:
             logger.warning("Markdown-отправка не удалась: %s", e)
+            details["markdown_exception"] = str(e)
             response = None
         if response is not None and response.ok:
             message_ids.append(extract_message_id(response))
@@ -385,36 +1020,41 @@ def try_send_post(bot_token: str, chat_id: str, file_path: Path, logger, config:
 
         status = response.status_code if response is not None else 0
         body = response.text if response is not None else "no response"
+        details["markdown_status_code"] = status
+        details["markdown_response_text"] = shorten_text(body, 700)
         if is_permanent_telegram_error(status, body):
-            return False, f"permanent_error: {body[:300]}", {}
+            return False, "permanent_error", details
 
         def plain_request():
             return send_message(bot_token, chat_id, part, None, disable_web_page_preview, reply_markup)
+        details["stage"] = "send_text_plain"
         try:
             fallback = retry_request(plain_request, logger)
         except Exception as e:
-            return False, f"temporary_error: {e}", {}
+            details["plain_exception"] = str(e)
+            return False, "temporary_error", details
         if not fallback.ok:
+            details["plain_status_code"] = fallback.status_code
+            details["plain_response_text"] = shorten_text(fallback.text, 700)
             if is_permanent_telegram_error(fallback.status_code, fallback.text):
-                return False, f"permanent_error: {fallback.text[:300]}", {}
-            return False, f"temporary_error: HTTP {fallback.status_code}: {fallback.text[:300]}", {}
+                return False, "permanent_error", details
+            return False, "temporary_error", details
         message_ids.append(extract_message_id(fallback))
 
-    return True, None, {"message_ids": [mid for mid in message_ids if mid], "mode": "text"}
+    details["message_ids"] = [mid for mid in message_ids if mid]
+    return True, None, {"message_ids": [mid for mid in message_ids if mid], "mode": "text", "debug": details}
 
 
-def should_send_story(config: dict, env_name: str, post_filename: str, state: dict) -> bool:
-    stories = config.get("content", {}).get("stories", {})
-    if not stories.get("enabled", False):
-        return False
-    if not stories.get("use_first_post_only", True):
-        return True
-    day_label = post_filename[:10]
-    if "_01_" not in post_filename:
-        return False
-    day_state = state.get("days", {}).get(day_label, {})
-    story_state = day_state.get("story", {})
-    return not story_state.get(f"sent_{env_name}", False)
+def build_send_alert_body(script_name: str, env_name: str, debug: dict, extra: dict | None = None) -> str:
+    context = {
+        "script": script_name,
+        "server": socket.gethostname(),
+        "env": env_name,
+    }
+    context.update(debug or {})
+    if extra:
+        context.update(extra)
+    return format_context_lines(context)
 
 
 def strip_markdown_for_story(text: str) -> str:
@@ -423,192 +1063,6 @@ def strip_markdown_for_story(text: str) -> str:
     text = re.sub(r"⚠️\s*Дисклеймер:.*", "", text, flags=re.S)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
-
-def extract_story_title_and_body(post_text: str) -> tuple[str, str]:
-    clean = strip_markdown_for_story(post_text)
-    lines = [line.strip(" -—\t") for line in clean.splitlines() if line.strip()]
-    title = lines[0].replace("📌", "").strip() if lines else "Новый пост в канале"
-    body_lines = [line for line in lines[1:] if not line.startswith(("📰", "📊", "📉", "💡"))]
-    body = " ".join(body_lines[:8]).strip()
-    return title[:120], body[:520]
-
-
-def get_story_font(size: int, bold: bool = False):
-    try:
-        from PIL import ImageFont
-    except Exception:
-        return None
-
-    candidates = [
-        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return ImageFont.truetype(candidate, size)
-    return ImageFont.load_default()
-
-
-def draw_wrapped_text(draw, xy, text: str, font, fill, max_width: int, line_spacing: int = 10, max_lines: int | None = None) -> int:
-    x, y = xy
-    lines = []
-    for paragraph in text.splitlines() or [text]:
-        current = ""
-        for word in paragraph.split():
-            trial = f"{current} {word}".strip()
-            bbox = draw.textbbox((0, 0), trial, font=font)
-            if bbox[2] - bbox[0] <= max_width or not current:
-                current = trial
-            else:
-                lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-    if max_lines:
-        lines = lines[:max_lines]
-    for line in lines:
-        draw.text((x, y), line, font=font, fill=fill)
-        bbox = draw.textbbox((x, y), line, font=font)
-        y += (bbox[3] - bbox[1]) + line_spacing
-    return y
-
-
-def generate_story_card_image(post_text: str, config: dict, width: int = 1080, height: int = 1920) -> tuple[bytes, str]:
-    try:
-        from PIL import Image, ImageDraw
-    except Exception:
-        return generate_default_story_background(width, height), "story_background.png"
-
-    title, body = extract_story_title_and_body(post_text)
-    image = Image.new("RGB", (width, height), (9, 16, 26))
-    draw = ImageDraw.Draw(image)
-
-    for y in range(height):
-        ratio = y / max(height - 1, 1)
-        color = (
-            int(20 * (1 - ratio) + 6 * ratio),
-            int(42 * (1 - ratio) + 12 * ratio),
-            int(58 * (1 - ratio) + 22 * ratio),
-        )
-        draw.line([(0, y), (width, y)], fill=color)
-
-    card = (86, 360, 994, 1280)
-    draw.rounded_rectangle(card, radius=52, fill=(245, 240, 226), outline=(224, 177, 84), width=5)
-    draw.rounded_rectangle((126, 410, 430, 472), radius=31, fill=(19, 32, 45))
-
-    label_font = get_story_font(28, bold=True)
-    title_font = get_story_font(54, bold=True)
-    body_font = get_story_font(35)
-    cta_font = get_story_font(34, bold=True)
-
-    draw.text((158, 424), "НОВЫЙ ПОСТ", font=label_font, fill=(245, 240, 226))
-    y = draw_wrapped_text(draw, (136, 545), title, title_font, (18, 32, 45), 810, line_spacing=16, max_lines=5)
-    y += 34
-    draw_wrapped_text(draw, (136, y), body, body_font, (42, 54, 66), 810, line_spacing=13, max_lines=8)
-    draw.rounded_rectangle((136, 1160, 944, 1232), radius=36, fill=(18, 32, 45))
-    draw.text((272, 1177), "Нажмите, чтобы открыть пост", font=cta_font, fill=(245, 240, 226))
-
-    import io
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
-    return buffer.getvalue(), "story_card.png"
-
-
-def generate_default_story_background(width: int = 1080, height: int = 1920) -> bytes:
-    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + chunk_type
-            + data
-            + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
-        )
-
-    top = (18, 32, 48)
-    bottom = (7, 12, 20)
-    rows = []
-    for y in range(height):
-        ratio = y / max(height - 1, 1)
-        color = bytes(int(top[i] * (1 - ratio) + bottom[i] * ratio) for i in range(3))
-        rows.append(b"\x00" + color * width)
-
-    raw = b"".join(rows)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + png_chunk(b"IDAT", zlib.compress(raw, 9))
-        + png_chunk(b"IEND", b"")
-    )
-
-
-def build_post_area(config: dict, input_channel, message_id: int):
-    area_cfg = config.get("content", {}).get("stories", {}).get("post_area", {})
-    coordinates = types.MediaAreaCoordinates(
-        x=float(area_cfg.get("x", 50)),
-        y=float(area_cfg.get("y", 43)),
-        w=float(area_cfg.get("w", 86)),
-        h=float(area_cfg.get("h", 48)),
-        rotation=float(area_cfg.get("rotation", 0)),
-        radius=float(area_cfg.get("radius", 16)),
-    )
-    return types.InputMediaAreaChannelPost(
-        coordinates=coordinates,
-        channel=input_channel,
-        msg_id=message_id,
-    )
-
-
-async def publish_story_for_post(config: dict, env_name: str, env_cfg: dict, post_file: str, message_id: int, state: dict, logger) -> bool:
-    stories = config.get("content", {}).get("stories", {})
-    if not stories.get("enabled", False):
-        return False
-
-    post_path = Path(post_file)
-    post_text = post_path.read_text(encoding="utf-8").strip()
-    story_chat_id = env_cfg.get("story_chat_id")
-    channel_chat_id = env_cfg.get("channel_chat_id")
-    if not story_chat_id or not channel_chat_id:
-        raise ValueError(f"Не заполнены environments.{env_name}.story_chat_id/channel_chat_id")
-
-    image_bytes, file_name = generate_story_card_image(post_text, config)
-    tg = config.get("telegram", {})
-    async with TelegramClient(tg["session_name"], tg["api_id"], tg["api_hash"]) as client:
-        peer = await client.get_input_entity(story_chat_id)
-        await client(functions.stories.CanSendStoryRequest(peer=peer))
-        uploaded = await client.upload_file(image_bytes, file_name=file_name)
-        media = types.InputMediaUploadedPhoto(file=uploaded)
-        channel_entity = await client.get_entity(channel_chat_id)
-        input_channel = utils.get_input_channel(channel_entity)
-        media_area = build_post_area(config, input_channel, int(message_id))
-        await client(functions.stories.SendStoryRequest(
-            peer=peer,
-            media=media,
-            media_areas=[media_area],
-            caption=stories.get("caption", "").strip()[:2048],
-            privacy_rules=[types.InputPrivacyValueAllowAll()],
-            period=stories.get("period", 86400),
-        ))
-
-    day_label = post_path.name[:10]
-    story_state = state.setdefault("days", {}).setdefault(day_label, {}).setdefault("story", {})
-    story_state[f"sent_{env_name}"] = True
-    story_state[f"sent_at_{env_name}"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    story_state[f"post_file_{env_name}"] = str(post_file)
-    story_state[f"message_id_{env_name}"] = int(message_id)
-    logger.info("Story опубликована из send_posts.py | env=%s | post=%s | message_id=%s", env_name, post_file, message_id)
-    return True
-
-
-def mark_story_failure(state: dict, env_name: str, post_file: str, message_id: int, error: Exception) -> None:
-    post_path = Path(post_file)
-    day_label = post_path.name[:10]
-    story_state = state.setdefault("days", {}).setdefault(day_label, {}).setdefault("story", {})
-    story_state[f"status_{env_name}"] = "failed"
-    story_state[f"failed_at_{env_name}"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    story_state[f"post_file_{env_name}"] = str(post_file)
-    story_state[f"message_id_{env_name}"] = int(message_id)
-    story_state[f"error_{env_name}"] = str(error)
 
 
 def parse_args():
@@ -629,7 +1083,7 @@ def main():
     paths = get_paths(config)
     runtime = config.get("runtime", {})
     logger = setup_logging("send_posts", args.log_dir or paths.get("log_dir", "logs"), args.log_level or runtime.get("log_level", "INFO"), "sender.log")
-    lock_path = config.get("locks", {}).get("send_posts", "locks/send_posts.lock")
+    lock_path = get_lock_path(config, "send_posts", "publish_telegram", "locks/send_posts.lock")
 
     with LockFile(lock_path):
         try:
@@ -644,9 +1098,16 @@ def main():
             sent_media_dir = paths.get("sent_media_dir", "sent_media")
             failed_media_dir = paths.get("failed_media_dir", "failed_media")
             state_path = paths.get("state_path", "state.json")
+            state = load_state(state_path)
 
             if not bot_token or not chat_id:
                 logger.error("Не заполнены sender_bot_token или environments.%s.channel_chat_id", env_name)
+                send_alert(
+                    config,
+                    "Ошибка конфигурации send_posts.py",
+                    build_send_alert_body("send_posts.py", env_name, {"chat_id": chat_id, "sender_bot_token_present": bool(bot_token)}),
+                    logger,
+                )
                 return 1
 
             posts = load_markdown_files(posts_dir)
@@ -658,12 +1119,89 @@ def main():
             logger.info("Env=%s | Найдено постов: %s | к отправке: %s", env_name, len(posts), next_post.name)
 
             if args.dry_run:
+                if should_send_digest(config, env_name, next_post.name, state):
+                    logger.info("dry-run: перед первым постом был бы собран и отправлен digest за предыдущий день")
                 logger.info("dry-run: пост был бы отправлен: %s", next_post)
                 return 0
 
+            if should_send_digest(config, env_name, next_post.name, state):
+                day_label = next_post.name[:10]
+                digest_payload, digest_meta = build_daily_digest_message(config, state, env_name, day_label, logger)
+                if not digest_payload:
+                    skip_reason = "no_source_posts" if digest_meta.get("source_day_label") else "no_source_posts_in_lookback"
+                    mark_digest_result(state, env_name, day_label, "skipped", source_day=digest_meta.get("source_day_label"), reason=skip_reason)
+                    save_state(state_path, state)
+                    if digest_meta.get("source_day_label"):
+                        logger.info("Digest пропущен: нет отправленных постов за %s", digest_meta.get("source_day_label"))
+                    else:
+                        logger.info("Digest пропущен: в окне поиска не найдено ни одного предыдущего дня с отправленными постами")
+                else:
+                    artifact_paths = save_digest_artifacts(
+                        config,
+                        day_label,
+                        digest_payload["telegram_message"],
+                        digest_payload["plain_message"],
+                        digest_meta,
+                        logger,
+                    )
+                    ok_digest, digest_result = send_digest_message(bot_token, chat_id, digest_payload, logger, args.disable_web_page_preview)
+                    if ok_digest:
+                        vk_result = None
+                        vk_ok = False
+                        if should_publish_vk_digest(config):
+                            vk_ok, vk_result = send_digest_to_vk(config, digest_payload, logger)
+                        mark_digest_result(
+                            state,
+                            env_name,
+                            day_label,
+                            "sent",
+                            source_day=digest_meta.get("source_day_label"),
+                            items_count=digest_meta.get("items_count"),
+                            summary_source=digest_meta.get("summary_source"),
+                            message_id=digest_result.get("message_id"),
+                            text_path=artifact_paths.get("text_path"),
+                            telegram_path=artifact_paths.get("telegram_path"),
+                            json_path=artifact_paths.get("json_path"),
+                            vk_status="sent" if vk_ok else ("failed" if vk_result else "skipped"),
+                            vk_post_id=(vk_result or {}).get("post_id") if vk_result else None,
+                            vk_error=(vk_result or {}).get("exception") if vk_result and not vk_ok else None,
+                        )
+                        save_state(state_path, state)
+                        logger.info("Digest отправлен перед первым постом | day=%s | source_day=%s", day_label, digest_meta.get("source_day_label"))
+                        if vk_result and not vk_ok:
+                            send_alert(
+                                config,
+                                "Ошибка публикации digest в VK",
+                                build_send_alert_body("send_posts.py", env_name, vk_result, digest_meta | {"day_label": day_label}),
+                                logger,
+                            )
+                            logger.warning("Digest отправлен в Telegram, но не опубликован в VK | day=%s", day_label)
+                    else:
+                        mark_digest_result(
+                            state,
+                            env_name,
+                            day_label,
+                            "failed",
+                            source_day=digest_meta.get("source_day_label"),
+                            items_count=digest_meta.get("items_count"),
+                            summary_source=digest_meta.get("summary_source"),
+                            error=digest_result.get("exception") or digest_result.get("response_text") or "unknown_error",
+                            text_path=artifact_paths.get("text_path"),
+                            telegram_path=artifact_paths.get("telegram_path"),
+                            json_path=artifact_paths.get("json_path"),
+                        )
+                        save_state(state_path, state)
+                        send_alert(
+                            config,
+                            "Ошибка отправки digest",
+                            build_send_alert_body("send_posts.py", env_name, digest_result, digest_meta | {"day_label": day_label}),
+                            logger,
+                        )
+                        logger.warning("Digest не отправлен, но лента продолжит работу | day=%s", day_label)
+
             ok, error_kind, send_result = try_send_post(bot_token, chat_id, next_post, logger, config, env_cfg, args.disable_web_page_preview)
-            state = load_state(state_path)
             queue = state.setdefault("send_queue", [])
+            debug = send_result.get("debug", send_result) if isinstance(send_result, dict) else {}
 
             if ok:
                 moved = move_associated_files(next_post, sent_posts_dir, sent_media_dir, logger)
@@ -677,50 +1215,40 @@ def main():
                     "sent_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 }
                 save_publication_metadata(moved.get("meta"), publication)
-                queue.append({"file": moved["md"], "status": "sent", **publication})
+                queue.append({"file": moved["md"], "status": "sent", **publication, "debug": debug})
                 save_state(state_path, state)
-
-                if publication["message_id"] and should_send_story(config, env_name, Path(moved["md"]).name, state):
-                    try:
-                        asyncio.run(publish_story_for_post(
-                            config,
-                            env_name,
-                            env_cfg,
-                            moved["md"],
-                            publication["message_id"],
-                            state,
-                            logger,
-                        ))
-                        save_state(state_path, state)
-                    except RPCError as e:
-                        logger.exception("RPC ошибка публикации story: %s", e)
-                        mark_story_failure(state, env_name, moved["md"], publication["message_id"], e)
-                        save_state(state_path, state)
-                        send_alert(config, "Ошибка публикации story", f"Env: {env_name}\nФайл: {moved['md']}\nОшибка: {e}", logger)
-                    except Exception as e:
-                        logger.exception("Критическая ошибка публикации story: %s", e)
-                        mark_story_failure(state, env_name, moved["md"], publication["message_id"], e)
-                        save_state(state_path, state)
-                        send_alert(config, "Критическая ошибка публикации story", f"Env: {env_name}\nФайл: {moved['md']}\nОшибка: {e}", logger)
-                elif not publication["message_id"]:
-                    logger.warning("Story не запущена: Telegram не вернул message_id для %s", moved["md"])
                 return 0
 
-            if error_kind and error_kind.startswith("permanent_error"):
+            if error_kind == "permanent_error":
                 moved = move_associated_files(next_post, failed_posts_dir, failed_media_dir, logger)
-                queue.append({"file": moved["md"], "status": "failed_permanent", "env": env_name, "error": error_kind, "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+                queue.append({"file": moved["md"], "status": "failed_permanent", "env": env_name, "error": error_kind, "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "debug": debug})
                 save_state(state_path, state)
-                send_alert(config, "Ошибка отправки поста", f"Скрипт: send_posts.py\nСервер: {socket.gethostname()}\nEnv: {env_name}\nФайл: {next_post.name}\nОшибка: {error_kind}", logger)
+                send_alert(
+                    config,
+                    "Ошибка отправки поста",
+                    build_send_alert_body("send_posts.py", env_name, debug, {"error_kind": error_kind}),
+                    logger,
+                )
                 return 1
 
-            queue.append({"file": str(next_post), "status": "retry_later", "env": env_name, "error": error_kind, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+            queue.append({"file": str(next_post), "status": "retry_later", "env": env_name, "error": error_kind, "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "debug": debug})
             save_state(state_path, state)
-            send_alert(config, "Временная ошибка отправки", f"Скрипт: send_posts.py\nСервер: {socket.gethostname()}\nEnv: {env_name}\nФайл: {next_post.name}\nОшибка: {error_kind}", logger)
+            send_alert(
+                config,
+                "Временная ошибка отправки",
+                build_send_alert_body("send_posts.py", env_name, debug, {"error_kind": error_kind or "temporary_error"}),
+                logger,
+            )
             return 1
 
         except Exception as e:
             logger.exception("Критическая ошибка send_posts.py: %s", e)
-            send_alert(config, "Критическая ошибка send_posts.py", f"Ошибка: {e}", logger)
+            send_alert(
+                config,
+                "Критическая ошибка send_posts.py",
+                build_send_alert_body("send_posts.py", locals().get("env_name", config.get("env", "test")), {"exception": str(e)}),
+                logger,
+            )
             return 1
 
 
