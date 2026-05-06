@@ -339,7 +339,7 @@ def call_openrouter(config: dict, prompt_text: str, source_text: str, logger, sy
         "Authorization": f"Bearer {openrouter['api_key']}",
         "Content-Type": "application/json",
         "HTTP-Referer": openrouter.get("site_url") or "https://localhost",
-        "X-Title": openrouter.get("app_name", "tgpost"),
+        "X-Title": openrouter.get("app_name", "NewsSender"),
     }
 
     def do_request():

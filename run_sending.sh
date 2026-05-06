@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-PROJECT_DIR="/root/tgpost"
+PROJECT_DIR="/root/NewsSender"
 VENV_PY="$PROJECT_DIR/venv/bin/python"
 RUN_LOG="$PROJECT_DIR/logs/runner_send.log"
 mkdir -p "$PROJECT_DIR/logs"

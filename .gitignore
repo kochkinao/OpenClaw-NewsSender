@@ -8,6 +8,7 @@ venv/
 
 # Ignore secrets
 config.json
+state.json
 
 # Ignore sessions
 *.session*

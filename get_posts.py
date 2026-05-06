@@ -404,7 +404,7 @@ def call_openrouter(config: dict, prompt_text: str, source_text: str, logger, sy
         "Authorization": f"Bearer {openrouter['api_key']}",
         "Content-Type": "application/json",
         "HTTP-Referer": openrouter.get("site_url") or "https://localhost",
-        "X-Title": openrouter.get("app_name", "tgpost"),
+        "X-Title": openrouter.get("app_name", "NewsSender"),
     }
 
     def do_request():
@@ -1100,7 +1100,7 @@ async def main():
                     payload = await export_period(client, channels, export_range, timezone_name, logger)
                     day_state = ensure_day_state(state, export_range.label)
 
-                    json_path = build_output_path(output_dir, paths.get("output_prefix", "tgposts"), export_range.label, datetime.now(tz), "json")
+                    json_path = build_output_path(output_dir, paths.get("output_prefix", "NewsSenders"), export_range.label, datetime.now(tz), "json")
                     if not args.dry_run:
                         save_json(json_path, payload)
                         logger.info("JSON сохранён: %s", json_path)
